@@ -34,6 +34,29 @@ if (adminChatIds.length === 0) {
   process.exit(1);
 }
 
+const rawDuffChatIds = Array.isArray(config.duffChatIds)
+  ? config.duffChatIds
+  : config.duffChatId
+    ? [config.duffChatId]
+    : [];
+const duffChatIds = rawDuffChatIds
+  .map((id) => Number(id))
+  .filter((id) => Number.isFinite(id));
+
+const adminAliases = {};
+if (config.adminAliases && typeof config.adminAliases === "object") {
+  Object.entries(config.adminAliases).forEach(([id, alias]) => {
+    const adminId = Number(id);
+    if (!Number.isFinite(adminId) || typeof alias !== "string") {
+      return;
+    }
+    const trimmed = alias.trim();
+    if (trimmed) {
+      adminAliases[adminId] = trimmed;
+    }
+  });
+}
+
 const bannedChatIds = new Set(
   (config.bannedChatIds || [])
     .map((id) => Number(id))
@@ -69,6 +92,7 @@ const rateLimitMaxTickets = Number.isFinite(rateLimitMaxTicketsValue)
 const rateLimitWindowMs =
   rateLimitWindowMinutes > 0 ? rateLimitWindowMinutes * 60 * 1000 : 0;
 const rateLimitEnabled = rateLimitWindowMs > 0 && rateLimitMaxTickets > 0;
+const duffCutRate = 0.25;
 
 const botUsernames = {
   food: config.foodBotUsername || "",
@@ -82,6 +106,12 @@ const LOGO_PATH = path.join(__dirname, "..", "allat50.png");
 
 const normalizeUsername = (value) =>
   value ? String(value).replace(/^@/, "") : "";
+
+const escapeHtml = (value) =>
+  String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 
 const formatHybridLink = (label, url) =>
   `<a href="${url}">| ${label} |</a>`;
@@ -118,6 +148,7 @@ const bot = new Telegraf(token);
 const sessions = new Map();
 const tickets = new Map();
 const adminTicketMessages = new Map();
+const duffRequestMessages = new Map();
 const customerTickets = new Map();
 const ticketHistory = new Map();
 let ticketCounter = Number.isFinite(Number(config.ticketCounter))
@@ -450,9 +481,42 @@ const formatHotelSummary = (session) => {
   ].join("\n");
 };
 
+const formatTicketSummary = (ticket) => {
+  if (ticket.service === "Flights" || ticket.botKey === "flight") {
+    return formatFlightSummary({ answers: ticket.answers || {} });
+  }
+  if (ticket.service === "Hotels" || ticket.botKey === "hotel") {
+    return formatHotelSummary({ answers: ticket.answers || {} });
+  }
+  return formatFoodSummary({
+    foodCategory: ticket.category || "-",
+    answers: ticket.answers || {},
+  });
+};
+
+const formatTicketLine = (ticketId, ticket) => {
+  const serviceLabel = escapeHtml(ticket.service || ticket.category || "Order");
+  const assigned = escapeHtml(ticket.assignedAlias || "Unassigned");
+  const couponState = ticket.couponRequested ? "Coupon requested" : "No coupon";
+  return `#${ticketId} ${serviceLabel} · ${assigned} · ${couponState}`;
+};
+
+const formatClosedLine = (ticketId, record) => {
+  const profit = Number(record.profit) || 0;
+  const duffCut = Number(record.duffCut) || profit * duffCutRate;
+  const closedBy = escapeHtml(record.closedBy || "-");
+  return `#${ticketId} Profit: $${profit.toFixed(2)} · Duff: $${duffCut.toFixed(
+    2
+  )} · ${closedBy}`;
+};
+
 const isAdminChat = (ctx) => adminChatIds.includes(ctx.chat.id);
+const isDuffChat = (ctx) => duffChatIds.includes(ctx.chat.id);
+const adminAlias = (ctx) =>
+  adminAliases[ctx.chat.id] || ctx.from?.first_name || "Worker";
 
 const adminMessageKey = (chatId, messageId) => `${chatId}:${messageId}`;
+const duffMessageKey = (chatId, messageId) => `${chatId}:${messageId}`;
 
 const adminTicketKeyboard = (ticketId) =>
   Markup.inlineKeyboard([
@@ -460,6 +524,7 @@ const adminTicketKeyboard = (ticketId) =>
       Markup.button.callback("🛑 Close ticket", `close:${ticketId}`),
       Markup.button.callback("🚫 Ban customer", `ban:${ticketId}`),
     ],
+    [Markup.button.callback("🎟️ Request coupon", `coupon:${ticketId}`)],
   ]);
 
 const nextTicketId = () => {
@@ -493,6 +558,16 @@ const closeTicketRecord = (ticketId, updates) => {
   return true;
 };
 
+const updateTicketRecord = (ticketId, updates) => {
+  const record = ticketRecords.get(ticketId);
+  if (!record) {
+    return false;
+  }
+  ticketRecords.set(ticketId, { ...record, ...updates });
+  saveConfig();
+  return true;
+};
+
 const summarizeReport = () => {
   const totals = {
     total: 0,
@@ -500,6 +575,8 @@ const summarizeReport = () => {
     closedWithRemarks: 0,
     closedNoOrder: 0,
     banned: 0,
+    profitTotal: 0,
+    duffTotal: 0,
   };
 
   for (const record of ticketRecords.values()) {
@@ -510,6 +587,9 @@ const summarizeReport = () => {
     }
     if (record.closeType === "admin_close") {
       totals.closedWithRemarks += 1;
+      const profit = Number(record.profit) || 0;
+      totals.profitTotal += profit;
+      totals.duffTotal += Number(record.duffCut) || profit * duffCutRate;
       continue;
     }
     if (record.closeType === "banned") {
@@ -674,6 +754,8 @@ const sendHome = async (ctx, caption, keyboard) => {
 
 const saveConfig = () => {
   config.adminChatIds = adminChatIds;
+  config.duffChatIds = duffChatIds;
+  config.adminAliases = adminAliases;
   config.bannedChatIds = Array.from(bannedChatIds);
   config.ticketCounter = ticketCounter;
   config.ticketRecords = Object.fromEntries(ticketRecords.entries());
@@ -683,7 +765,7 @@ const saveConfig = () => {
 const isBannedChat = (chatId) => bannedChatIds.has(chatId);
 
 const banGuard = async (ctx, next) => {
-  if (isAdminChat(ctx)) {
+  if (isAdminChat(ctx) || isDuffChat(ctx)) {
     return next();
   }
   const chatId = ctx.chat?.id;
@@ -762,6 +844,7 @@ bot.command("cancel", (ctx) => {
   );
 });
 
+
 bot.command("report", (ctx) => {
   if (!isAdminChat(ctx)) {
     return;
@@ -774,6 +857,8 @@ bot.command("report", (ctx) => {
     `Closed w/ remarks: <b>${totals.closedWithRemarks}</b>\n` +
     `Closed no order: <b>${totals.closedNoOrder}</b>\n` +
     `Banned: <b>${totals.banned}</b>\n` +
+    `Profit total: <b>$${totals.profitTotal.toFixed(2)}</b>\n` +
+    `Duff 25%: <b>$${totals.duffTotal.toFixed(2)}</b>\n` +
     `Last ticket #: <b>${ticketCounter}</b>`;
   return replyHtml(ctx, report);
 });
@@ -785,18 +870,25 @@ bot.command("close", (ctx) => {
   const text = ctx.message.text.trim();
   const match = text.match(/^\/close\s+(\d+)\s+([\s\S]+)/i);
   if (!match) {
-    return ctx.reply('Usage: /close <ticket_id> "Profit/remarks"');
+    return ctx.reply('Usage: /close <ticket_id> <profit> "remarks"');
   }
   const ticketId = Number(match[1]);
   let remarks = match[2].trim();
+  let profit = 0;
   if (
     (remarks.startsWith('"') && remarks.endsWith('"')) ||
     (remarks.startsWith("'") && remarks.endsWith("'"))
   ) {
     remarks = remarks.slice(1, -1).trim();
+  } else {
+    const profitMatch = remarks.match(/^([+-]?\d+(?:\.\d+)?)\s*(.*)$/);
+    if (profitMatch) {
+      profit = Number(profitMatch[1]);
+      remarks = profitMatch[2].trim() || `Profit recorded: $${profit.toFixed(2)}`;
+    }
   }
   if (!Number.isFinite(ticketId) || !remarks) {
-    return ctx.reply('Usage: /close <ticket_id> "Profit/remarks"');
+    return ctx.reply('Usage: /close <ticket_id> <profit> "remarks"');
   }
 
   const ticket = tickets.get(ticketId);
@@ -804,10 +896,13 @@ bot.command("close", (ctx) => {
     return ctx.reply("Ticket already closed.");
   }
 
+  const duffCut = Number((profit * duffCutRate).toFixed(2));
   const updated = closeTicketRecord(ticketId, {
     closeType: "admin_close",
     remarks,
-    closedBy: ctx.from.first_name || "Admin",
+    closedBy: adminAlias(ctx),
+    profit,
+    duffCut,
   });
 
   if (!updated) {
@@ -825,7 +920,24 @@ bot.command("close", (ctx) => {
     bot.telegram.sendMessage(chatId, `Ticket #${ticketId} has been closed.`);
   }
 
-  return ctx.reply(`Ticket #${ticketId} closed with remarks.`);
+  if (duffChatIds.length > 0) {
+    duffChatIds.forEach((chatId) => {
+      bot.telegram
+        .sendMessage(
+          chatId,
+          `✅ Ticket #${ticketId} closed.\nProfit: $${profit.toFixed(
+            2
+          )}\nDuff 25%: $${duffCut.toFixed(2)}`
+        )
+        .catch(() => {});
+    });
+  }
+
+  return ctx.reply(
+    `Ticket #${ticketId} closed. Profit: $${profit.toFixed(
+      2
+    )} · Duff: $${duffCut.toFixed(2)}`
+  );
 });
 
 bot.command("ban", (ctx) => {
@@ -838,7 +950,7 @@ bot.command("ban", (ctx) => {
     return ctx.reply("Usage: /ban <chat_id>");
   }
   bannedChatIds.add(chatId);
-  closeTicketsForChat(chatId, "banned", ctx.from.first_name || "Admin");
+  closeTicketsForChat(chatId, "banned", adminAlias(ctx));
   saveConfig();
   return ctx.reply(`Chat ${chatId} banned.`);
 });
@@ -884,7 +996,7 @@ const registerAdminReplyHandler = (botInstance, botKey) => {
       return;
     }
 
-    const adminLabel = ctx.from.first_name || "Admin";
+    const adminLabel = adminAlias(ctx);
 
     if (ctx.message.text) {
       await ctx.telegram.sendMessage(
@@ -903,7 +1015,376 @@ const registerAdminReplyHandler = (botInstance, botKey) => {
   });
 };
 
+const registerDuffReplyHandler = (botInstance) => {
+  botInstance.on("message", async (ctx, next) => {
+    if (!isDuffChat(ctx)) {
+      return next();
+    }
+
+    const reply = ctx.message?.reply_to_message;
+    if (!reply) {
+      return next();
+    }
+
+    const entry = duffRequestMessages.get(
+      duffMessageKey(ctx.chat.id, reply.message_id)
+    );
+    if (!entry) {
+      return next();
+    }
+
+    const ticket = tickets.get(entry.ticketId);
+    if (!ticket || ticket.status !== "open") {
+      await ctx.reply("Ticket is closed or no longer exists.");
+      return;
+    }
+
+    const adminId = ticket.assignedAdminId;
+    if (!adminId) {
+      await ctx.reply("No worker assigned yet. Ask them to /accept first.");
+      return;
+    }
+
+    const couponText = ctx.message?.text;
+    if (!couponText) {
+      await ctx.reply("Please send coupon text.");
+      return;
+    }
+
+    const duffName = ctx.from?.first_name || "Duff";
+    ticket.couponProvidedBy = duffName;
+    ticket.couponProvidedAt = new Date().toISOString();
+    ticket.couponText = couponText;
+    tickets.set(entry.ticketId, ticket);
+    updateTicketRecord(entry.ticketId, {
+      couponProvidedBy: duffName,
+      couponProvidedAt: ticket.couponProvidedAt,
+    });
+
+    await ctx.telegram.sendMessage(
+      adminId,
+      `🎟️ Duff coupon for ticket #${entry.ticketId}:\n${couponText}`
+    );
+    await ctx.reply("Coupon sent to the worker.");
+  });
+};
+
+const workPanel = (ctx) => {
+  if (!isAdminChat(ctx)) {
+    return;
+  }
+  const alias = escapeHtml(adminAlias(ctx));
+  const openTickets = Array.from(tickets.entries()).filter(
+    ([, ticket]) => ticket.status === "open"
+  );
+  const assigned = openTickets
+    .filter(([, ticket]) => ticket.assignedAdminId === ctx.chat.id)
+    .map(([ticketId, ticket]) => formatTicketLine(ticketId, ticket));
+  const unassigned = openTickets
+    .filter(([, ticket]) => !ticket.assignedAdminId)
+    .map(([ticketId, ticket]) => formatTicketLine(ticketId, ticket));
+
+  const lines = [
+    "👷 <b>Worker Panel</b>",
+    `Alias: <b>${alias}</b>`,
+    "",
+    "Commands:",
+    "• <code>/setname &lt;alias&gt;</code>",
+    "• <code>/accept &lt;ticket_id&gt;</code>",
+    '• <code>/close &lt;ticket_id&gt; &lt;profit&gt; "remarks"</code>',
+    "• Use <b>Request coupon</b> on a ticket to ping Duff",
+    "",
+  ];
+
+  if (assigned.length) {
+    lines.push("<b>Your open tickets</b>");
+    lines.push(...assigned.slice(0, 10).map((line) => `• ${line}`));
+    if (assigned.length > 10) {
+      lines.push(`...and ${assigned.length - 10} more`);
+    }
+    lines.push("");
+  }
+
+  if (unassigned.length) {
+    lines.push("<b>Unassigned tickets</b>");
+    lines.push(...unassigned.slice(0, 10).map((line) => `• ${line}`));
+    if (unassigned.length > 10) {
+      lines.push(`...and ${unassigned.length - 10} more`);
+    }
+  }
+
+  return replyHtml(ctx, lines.join("\n"));
+};
+
+const setnameCommand = (ctx) => {
+  if (!isAdminChat(ctx)) {
+    return;
+  }
+  const parts = ctx.message.text.trim().split(/\s+/);
+  parts.shift();
+  const alias = parts.join(" ").trim();
+  if (!alias) {
+    return ctx.reply("Usage: /setname <alias>");
+  }
+  adminAliases[ctx.chat.id] = alias;
+  saveConfig();
+  return ctx.reply(`Alias set to: ${alias}`);
+};
+
+const acceptCommand = (ctx) => {
+  if (!isAdminChat(ctx)) {
+    return;
+  }
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const ticketId = Number(parts[1]);
+  if (!Number.isFinite(ticketId)) {
+    return ctx.reply("Usage: /accept <ticket_id>");
+  }
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status !== "open") {
+    return ctx.reply("Ticket not found or already closed.");
+  }
+  if (ticket.assignedAdminId && ticket.assignedAdminId !== ctx.chat.id) {
+    return ctx.reply("Ticket already accepted by another worker.");
+  }
+
+  const alias = adminAlias(ctx);
+  ticket.assignedAdminId = ctx.chat.id;
+  ticket.assignedAlias = alias;
+  ticket.acceptedAt = new Date().toISOString();
+  tickets.set(ticketId, ticket);
+  updateTicketRecord(ticketId, {
+    assignedAdminId: ctx.chat.id,
+    assignedAlias: alias,
+    acceptedAt: ticket.acceptedAt,
+  });
+  return ctx.reply(`Ticket #${ticketId} accepted as ${alias}.`);
+};
+
+const duffPanel = (ctx) => {
+  if (!isDuffChat(ctx)) {
+    return;
+  }
+  const openTickets = Array.from(tickets.entries()).filter(
+    ([, ticket]) => ticket.status === "open"
+  );
+  const live = openTickets
+    .filter(([, ticket]) => ticket.couponRequested)
+    .map(([ticketId, ticket]) => formatTicketLine(ticketId, ticket));
+  const pending = openTickets
+    .filter(([, ticket]) => !ticket.couponRequested)
+    .map(([ticketId, ticket]) => formatTicketLine(ticketId, ticket));
+  const closedRecords = Array.from(ticketRecords.entries())
+    .filter(([, record]) => record.status === "closed" && record.closeType === "admin_close")
+    .sort((a, b) => b[0] - a[0]);
+  const totals = summarizeReport();
+
+  const lines = [
+    "🧩 <b>Duff Panel</b>",
+    `🟢 Live requests: <b>${live.length}</b>`,
+    `🟡 Open tickets: <b>${openTickets.length}</b>`,
+    `💰 Profit total: <b>$${totals.profitTotal.toFixed(2)}</b>`,
+    `🧮 Duff 25%: <b>$${totals.duffTotal.toFixed(2)}</b>`,
+    "",
+    "Commands:",
+    "• <code>/coupon &lt;ticket_id&gt; &lt;coupon text&gt;</code>",
+    "• Reply to a coupon request to send the coupon",
+    "",
+  ];
+
+  if (live.length) {
+    lines.push("🟢 <b>Live coupon requests</b>");
+    lines.push(...live.slice(0, 10).map((line) => `• ${line}`));
+    if (live.length > 10) {
+      lines.push(`...and ${live.length - 10} more`);
+    }
+    lines.push("");
+  }
+
+  if (pending.length) {
+    lines.push("🟡 <b>Open tickets</b>");
+    lines.push(...pending.slice(0, 10).map((line) => `• ${line}`));
+    if (pending.length > 10) {
+      lines.push(`...and ${pending.length - 10} more`);
+    }
+    lines.push("");
+  }
+
+  if (closedRecords.length) {
+    lines.push("✅ <b>Recent completed</b>");
+    closedRecords.slice(0, 10).forEach(([ticketId, record]) => {
+      lines.push(`• ${formatClosedLine(ticketId, record)}`);
+    });
+  }
+
+  return replyHtml(ctx, lines.join("\n"));
+};
+
+const couponCommand = (ctx) => {
+  if (!isDuffChat(ctx)) {
+    return;
+  }
+  const match = ctx.message.text.trim().match(/^\/coupon\s+(\d+)\s+([\s\S]+)$/i);
+  if (!match) {
+    return ctx.reply("Usage: /coupon <ticket_id> <coupon text>");
+  }
+  const ticketId = Number(match[1]);
+  const couponText = match[2].trim();
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status !== "open") {
+    return ctx.reply("Ticket not found or closed.");
+  }
+  if (!ticket.assignedAdminId) {
+    return ctx.reply("No worker assigned yet. Ask them to /accept first.");
+  }
+  const duffName = ctx.from?.first_name || "Duff";
+  ticket.couponProvidedBy = duffName;
+  ticket.couponProvidedAt = new Date().toISOString();
+  ticket.couponText = couponText;
+  tickets.set(ticketId, ticket);
+  updateTicketRecord(ticketId, {
+    couponProvidedBy: duffName,
+    couponProvidedAt: ticket.couponProvidedAt,
+  });
+  ctx.telegram
+    .sendMessage(
+      ticket.assignedAdminId,
+      `🎟️ Duff coupon for ticket #${ticketId}:\n${couponText}`
+    )
+    .catch(() => {});
+  return ctx.reply("Coupon sent to the worker.");
+};
+
+const requestCoupon = async (ctx, ticketId) => {
+  if (!isAdminChat(ctx)) {
+    await ctx.answerCbQuery("Not authorized.");
+    return;
+  }
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status !== "open") {
+    await ctx.answerCbQuery("Ticket not found or closed.");
+    return;
+  }
+  if (!ticket.assignedAdminId) {
+    await ctx.answerCbQuery("Accept first with /accept <ticket_id>.");
+    return;
+  }
+  if (ticket.assignedAdminId !== ctx.chat.id) {
+    await ctx.answerCbQuery("Only the assigned worker can request coupons.");
+    return;
+  }
+  if (!duffChatIds.length) {
+    await ctx.answerCbQuery("Duff panel is not configured.");
+    return;
+  }
+
+  const alias = adminAlias(ctx);
+  ticket.couponRequested = true;
+  ticket.couponRequestedBy = alias;
+  ticket.couponRequestedAt = new Date().toISOString();
+  tickets.set(ticketId, ticket);
+  updateTicketRecord(ticketId, {
+    couponRequested: true,
+    couponRequestedBy: alias,
+    couponRequestedAt: ticket.couponRequestedAt,
+  });
+
+  const summary = formatTicketSummary(ticket);
+  let text = `🎟️ Coupon request for ticket #${ticketId}\nService: ${
+    ticket.service || ticket.category || "Order"
+  }`;
+  if (ticket.category) {
+    text += `\nCategory: ${ticket.category}`;
+  }
+  text += `\nWorker: ${alias}\n\n${summary}\n\n`;
+  text += "Reply to this message with the coupon details, or use /coupon <ticket_id> <code>.";
+
+  duffChatIds.forEach((chatId) => {
+    ctx.telegram
+      .sendMessage(chatId, text)
+      .then((message) => {
+        duffRequestMessages.set(
+          duffMessageKey(chatId, message.message_id),
+          { ticketId, botKey: ticket.botKey }
+        );
+      })
+      .catch(() => {});
+  });
+
+  await ctx.answerCbQuery("Coupon request sent to Duff.");
+  await ctx.reply("🎟️ Coupon request sent to Duff manager.");
+};
+
+const handleCloseAction = async (ctx) => {
+  const ticketId = Number(ctx.match?.[1] || ctx.callbackQuery?.data?.split(":")[1]);
+  if (!isAdminChat(ctx)) {
+    await ctx.answerCbQuery("Not authorized.");
+    return;
+  }
+
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status === "closed") {
+    await ctx.answerCbQuery("Ticket already closed.");
+    return;
+  }
+
+  ticket.status = "closed";
+  tickets.set(ticketId, ticket);
+  customerTickets.delete(ticket.chatId);
+  closeTicketRecord(ticketId, {
+    closeType: "manual_close",
+    closedBy: adminAlias(ctx),
+  });
+
+  await ctx.answerCbQuery("Ticket closed.");
+  await ctx.reply(`Ticket #${ticketId} closed.`);
+  return ctx.telegram.sendMessage(
+    ticket.chatId,
+    `Ticket #${ticketId} has been closed by an admin.`
+  );
+};
+
+const handleBanAction = async (ctx) => {
+  const ticketId = Number(ctx.match?.[1] || ctx.callbackQuery?.data?.split(":")[1]);
+  if (!isAdminChat(ctx)) {
+    await ctx.answerCbQuery("Not authorized.");
+    return;
+  }
+
+  const ticket = tickets.get(ticketId);
+  if (!ticket) {
+    await ctx.answerCbQuery("Ticket not found.");
+    return;
+  }
+
+  bannedChatIds.add(ticket.chatId);
+  saveConfig();
+
+  ticket.status = "closed";
+  tickets.set(ticketId, ticket);
+  customerTickets.delete(ticket.chatId);
+  closeTicketRecord(ticketId, {
+    closeType: "banned",
+    closedBy: adminAlias(ctx),
+  });
+
+  await ctx.answerCbQuery("Customer banned.");
+  await ctx.reply(`Ticket #${ticketId} closed and customer banned.`);
+  return ctx.telegram.sendMessage(
+    ticket.chatId,
+    "🚫 <b>Access restricted.</b>",
+    { parse_mode: "HTML" }
+  );
+};
+
+bot.command("work", workPanel);
+bot.command("setname", setnameCommand);
+bot.command("accept", acceptCommand);
+bot.command("duff", duffPanel);
+bot.command("coupon", couponCommand);
+
 registerAdminReplyHandler(bot, "food");
+registerDuffReplyHandler(bot);
 
 bot.action("menu:main", async (ctx) => {
   resetSession(ctx.chat.id);
@@ -1102,6 +1583,7 @@ bot.on("text", (ctx) => {
         status: "open",
         adminMessages: [],
         botKey: "food",
+        service: "Food",
       });
       createTicketRecord(ticketId, {
         service: "Food",
@@ -1190,6 +1672,7 @@ bot.on("text", (ctx) => {
         status: "open",
         adminMessages: [],
         botKey: "food",
+        service: "Flights",
       });
       createTicketRecord(ticketId, {
         service: "Flights",
@@ -1278,6 +1761,7 @@ bot.on("text", (ctx) => {
         status: "open",
         adminMessages: [],
         botKey: "food",
+        service: "Hotels",
       });
       createTicketRecord(ticketId, {
         service: "Hotels",
@@ -1380,66 +1864,15 @@ bot.on("message", (ctx) => {
   );
 });
 
-bot.action(/^close:(\d+)/, async (ctx) => {
+bot.action(/^close:(\d+)/, handleCloseAction);
+bot.action(/^ban:(\d+)/, handleBanAction);
+bot.action(/^coupon:(\d+)/, async (ctx) => {
   const ticketId = Number(ctx.match[1]);
-  if (!adminChatIds.includes(ctx.chat.id)) {
-    await ctx.answerCbQuery("Not authorized.");
-    return;
-  }
-
-  const ticket = tickets.get(ticketId);
-  if (!ticket || ticket.status === "closed") {
-    await ctx.answerCbQuery("Ticket already closed.");
-    return;
-  }
-
-  ticket.status = "closed";
-  tickets.set(ticketId, ticket);
-  customerTickets.delete(ticket.chatId);
-  closeTicketRecord(ticketId, {
-    closeType: "manual_close",
-    closedBy: ctx.from.first_name || "Admin",
-  });
-
-  await ctx.answerCbQuery("Ticket closed.");
-  await ctx.reply(`Ticket #${ticketId} closed.`);
-  return bot.telegram.sendMessage(
-    ticket.chatId,
-    `Ticket #${ticketId} has been closed by an admin.`
-  );
-});
-
-bot.action(/^ban:(\d+)/, async (ctx) => {
-  const ticketId = Number(ctx.match[1]);
-  if (!adminChatIds.includes(ctx.chat.id)) {
-    await ctx.answerCbQuery("Not authorized.");
-    return;
-  }
-
-  const ticket = tickets.get(ticketId);
-  if (!ticket) {
+  if (!Number.isFinite(ticketId)) {
     await ctx.answerCbQuery("Ticket not found.");
     return;
   }
-
-  bannedChatIds.add(ticket.chatId);
-  saveConfig();
-
-  ticket.status = "closed";
-  tickets.set(ticketId, ticket);
-  customerTickets.delete(ticket.chatId);
-  closeTicketRecord(ticketId, {
-    closeType: "banned",
-    closedBy: ctx.from.first_name || "Admin",
-  });
-
-  await ctx.answerCbQuery("Customer banned.");
-  await ctx.reply(`Ticket #${ticketId} closed and customer banned.`);
-  return bot.telegram.sendMessage(
-    ticket.chatId,
-    "🚫 <b>Access restricted.</b>",
-    { parse_mode: "HTML" }
-  );
+  await requestCoupon(ctx, ticketId);
 });
 
 const botEntries = [{ bot, name: "food" }];
@@ -1454,6 +1887,7 @@ if (flightBotToken) {
 
   flightBot.use(banGuard);
   registerAdminReplyHandler(flightBot, "flight");
+  registerDuffReplyHandler(flightBot);
 
   flightBot.start((ctx) => {
     resetFlightSession(ctx.chat.id);
@@ -1475,6 +1909,12 @@ if (flightBotToken) {
     );
   });
 
+  flightBot.command("work", workPanel);
+  flightBot.command("setname", setnameCommand);
+  flightBot.command("accept", acceptCommand);
+  flightBot.command("duff", duffPanel);
+  flightBot.command("coupon", couponCommand);
+
   flightBot.action("flight:start", async (ctx) => {
     setFlightSession(ctx.chat.id, {
       service: "flight",
@@ -1485,6 +1925,17 @@ if (flightBotToken) {
     await ctx.answerCbQuery();
     await replyHtml(ctx, FLIGHT_PROMO);
     return replyHtml(ctx, FLIGHT_QUESTIONS[0].prompt);
+  });
+
+  flightBot.action(/^close:(\d+)/, handleCloseAction);
+  flightBot.action(/^ban:(\d+)/, handleBanAction);
+  flightBot.action(/^coupon:(\d+)/, async (ctx) => {
+    const ticketId = Number(ctx.match[1]);
+    if (!Number.isFinite(ticketId)) {
+      await ctx.answerCbQuery("Ticket not found.");
+      return;
+    }
+    await requestCoupon(ctx, ticketId);
   });
 
   flightBot.on("text", (ctx) => {
@@ -1543,6 +1994,7 @@ if (flightBotToken) {
         status: "open",
         adminMessages: [],
         botKey: "flight",
+        service: "Flights",
       });
       createTicketRecord(ticketId, {
         service: "Flights",
@@ -1627,6 +2079,7 @@ if (hotelBotToken) {
 
   hotelBot.use(banGuard);
   registerAdminReplyHandler(hotelBot, "hotel");
+  registerDuffReplyHandler(hotelBot);
 
   hotelBot.start((ctx) => {
     resetHotelSession(ctx.chat.id);
@@ -1648,6 +2101,12 @@ if (hotelBotToken) {
     );
   });
 
+  hotelBot.command("work", workPanel);
+  hotelBot.command("setname", setnameCommand);
+  hotelBot.command("accept", acceptCommand);
+  hotelBot.command("duff", duffPanel);
+  hotelBot.command("coupon", couponCommand);
+
   hotelBot.action("hotel:start", async (ctx) => {
     setHotelSession(ctx.chat.id, {
       service: "hotel",
@@ -1658,6 +2117,17 @@ if (hotelBotToken) {
     await ctx.answerCbQuery();
     await replyHtml(ctx, HOTEL_PROMO);
     return replyHtml(ctx, HOTEL_QUESTIONS[0].prompt);
+  });
+
+  hotelBot.action(/^close:(\d+)/, handleCloseAction);
+  hotelBot.action(/^ban:(\d+)/, handleBanAction);
+  hotelBot.action(/^coupon:(\d+)/, async (ctx) => {
+    const ticketId = Number(ctx.match[1]);
+    if (!Number.isFinite(ticketId)) {
+      await ctx.answerCbQuery("Ticket not found.");
+      return;
+    }
+    await requestCoupon(ctx, ticketId);
   });
 
   hotelBot.on("text", (ctx) => {
@@ -1716,6 +2186,7 @@ if (hotelBotToken) {
         status: "open",
         adminMessages: [],
         botKey: "hotel",
+        service: "Hotels",
       });
       createTicketRecord(ticketId, {
         service: "Hotels",
