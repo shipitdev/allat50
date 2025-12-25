@@ -11,17 +11,7 @@
   ],
   "bannedChatIds": [],
   "ticketCounter": 61,
-  "ticketRecords": {
-    "61": {
-      "ticketId": 61,
-      "status": "open",
-      "createdAt": "2025-12-24T09:45:13.037Z",
-      "service": "Food",
-      "category": "🐼 Panda Express",
-      "chatId": 7815575780,
-      "botKey": "food"
-    }
-  },
+  "ticketRecordsPath": "ticket_records.json",
   "sessionTimeoutMinutes": 15,
   "rateLimit": {
     "windowMinutes": 30,

@@ -7,7 +7,7 @@ import re
 import time
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -86,9 +86,40 @@ if isinstance(alias_map, dict):
         if isinstance(value, str) and value.strip():
             ADMIN_ALIASES[admin_id] = value.strip()
 
+records_path_value = CONFIG.get("ticketRecordsPath")
+if records_path_value:
+    records_path = Path(records_path_value)
+    if not records_path.is_absolute():
+        records_path = (CONFIG_PATH.parent / records_path_value).resolve()
+else:
+    records_path = CONFIG_PATH.parent / "ticket_records.json"
+TICKET_RECORDS_PATH = records_path
+
 TICKET_RECORDS = {}
-records = CONFIG.get("ticketRecords")
-if isinstance(records, dict):
+
+
+def save_ticket_records() -> None:
+    data = {str(k): v for k, v in TICKET_RECORDS.items()}
+    with TICKET_RECORDS_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def load_ticket_records() -> None:
+    records = None
+    legacy_loaded = False
+    if TICKET_RECORDS_PATH.exists():
+        try:
+            with TICKET_RECORDS_PATH.open("r", encoding="utf-8") as handle:
+                records = json.load(handle)
+        except json.JSONDecodeError:
+            logger.warning("Invalid ticket_records.json (JSON parse failed).")
+    elif isinstance(CONFIG.get("ticketRecords"), dict):
+        records = CONFIG.get("ticketRecords")
+        legacy_loaded = True
+
+    if not isinstance(records, dict):
+        return
+
     for key, record in records.items():
         try:
             ticket_id = int(key)
@@ -97,6 +128,14 @@ if isinstance(records, dict):
         if isinstance(record, dict):
             record["ticketId"] = ticket_id
             TICKET_RECORDS[ticket_id] = record
+
+    if not TICKET_RECORDS_PATH.exists() and TICKET_RECORDS:
+        save_ticket_records()
+    if legacy_loaded:
+        CONFIG.pop("ticketRecords", None)
+
+
+load_ticket_records()
 
 try:
     ticket_counter = int(CONFIG.get("ticketCounter", 60))
@@ -261,6 +300,8 @@ CUSTOMER_TICKETS = {}
 ADMIN_TICKET_MESSAGES = {}
 TICKET_HISTORY = {}
 DUFF_REQUEST_MESSAGES = {}
+ADMIN_PROMPTS = {}
+WORKER_LIST_MESSAGES = {}
 
 
 class SessionStore:
@@ -398,6 +439,48 @@ def main_menu() -> InlineKeyboardMarkup:
     return food_menu(include_back=False)
 
 
+def worker_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 View open tickets", callback_data="worker:view")],
+            [InlineKeyboardButton("✅ Close order", callback_data="worker:close")],
+            [InlineKeyboardButton("✍️ Set alias", callback_data="worker:alias")],
+        ]
+    )
+
+
+def truncate_label(value: str, max_len: int = 42) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3].rstrip() + "..."
+
+
+def ticket_brief(ticket: dict) -> str:
+    bot_key = ticket.get("botKey")
+    answers = ticket.get("answers") or {}
+    if bot_key == "food":
+        return ticket.get("category") or "Food"
+    if bot_key == "flight":
+        parts = [answers.get("trip_dates"), answers.get("airlines")]
+        summary = " · ".join([part for part in parts if part])
+        return summary or "Flight"
+    if bot_key == "hotel":
+        parts = [answers.get("destination"), answers.get("dates")]
+        summary = " · ".join([part for part in parts if part])
+        return summary or "Hotel"
+    return ticket.get("category") or ticket.get("service") or "Order"
+
+
+def worker_tickets_keyboard(open_tickets: list[tuple[int, dict]]) -> InlineKeyboardMarkup:
+    rows = []
+    for ticket_id, ticket in open_tickets:
+        summary = truncate_label(ticket_brief(ticket))
+        label = f"Accept #{ticket_id} · {summary}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"accept:{ticket_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="worker:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def flight_start_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("✈️ Start Flight Booking", callback_data="flight:start")]]
@@ -410,16 +493,18 @@ def hotel_start_menu() -> InlineKeyboardMarkup:
     )
 
 
-def admin_ticket_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def admin_ticket_keyboard(ticket_id: int, include_accept: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+    if include_accept:
+        rows.append([InlineKeyboardButton("✅ Accept order", callback_data=f"accept:{ticket_id}")])
+    rows.append(
         [
-            [
-                InlineKeyboardButton("🛑 Close ticket", callback_data=f"close:{ticket_id}"),
-                InlineKeyboardButton("🚫 Ban customer", callback_data=f"ban:{ticket_id}"),
-            ],
-            [InlineKeyboardButton("🎟️ Request coupon", callback_data=f"coupon:{ticket_id}")],
+            InlineKeyboardButton("🛑 Close ticket", callback_data=f"close:{ticket_id}"),
+            InlineKeyboardButton("🚫 Ban customer", callback_data=f"ban:{ticket_id}"),
         ]
     )
+    rows.append([InlineKeyboardButton("🎟️ Request coupon", callback_data=f"coupon:{ticket_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def save_config() -> None:
@@ -428,7 +513,7 @@ def save_config() -> None:
     CONFIG["adminAliases"] = {str(k): v for k, v in ADMIN_ALIASES.items()}
     CONFIG["bannedChatIds"] = list(BANNED_CHAT_IDS)
     CONFIG["ticketCounter"] = ticket_counter
-    CONFIG["ticketRecords"] = {str(k): v for k, v in TICKET_RECORDS.items()}
+    CONFIG.pop("ticketRecords", None)
     with CONFIG_PATH.open("w", encoding="utf-8") as handle:
         json.dump(CONFIG, handle, indent=2)
 
@@ -447,7 +532,7 @@ def create_ticket_record(ticket_id: int, data: dict) -> None:
         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         **data,
     }
-    save_config()
+    save_ticket_records()
 
 
 def close_ticket_record(ticket_id: int, updates: dict) -> bool:
@@ -462,7 +547,7 @@ def close_ticket_record(ticket_id: int, updates: dict) -> bool:
         }
     )
     TICKET_RECORDS[ticket_id] = record
-    save_config()
+    save_ticket_records()
     return True
 
 
@@ -472,7 +557,7 @@ def update_ticket_record(ticket_id: int, updates: dict) -> bool:
         return False
     record.update(updates)
     TICKET_RECORDS[ticket_id] = record
-    save_config()
+    save_ticket_records()
     return True
 
 
@@ -698,36 +783,56 @@ async def admin_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def forward_customer_message(bot, chat_id: int, ticket_id: int, ticket: dict, message):
     customer_label = message.from_user.first_name or "Customer"
     header = f"Customer ({customer_label}) on ticket #{ticket_id}:"
-    targets = ticket.get("adminMessages") or [
-        {"chatId": admin_id} for admin_id in ADMIN_CHAT_IDS
-    ]
+    assigned_id = ticket.get("assignedAdminId")
+    admin_messages = ticket.get("adminMessages") or []
+    if assigned_id:
+        targets = [entry for entry in admin_messages if entry.get("chatId") == assigned_id]
+        if not targets:
+            targets = [{"chatId": assigned_id}]
+    else:
+        targets = admin_messages or [{"chatId": admin_id} for admin_id in ADMIN_CHAT_IDS]
 
     for target in targets:
+        target_chat_id = target.get("chatId")
+        if not target_chat_id:
+            continue
         reply_id = target.get("messageId")
         try:
             if message.text:
-                sent = await bot.send_message(
-                    target["chatId"],
-                    f"{header} {message.text}",
-                    reply_to_message_id=reply_id,
-                )
-                ADMIN_TICKET_MESSAGES[(target["chatId"], sent.message_id)] = {
+                try:
+                    sent = await bot.send_message(
+                        target_chat_id,
+                        f"{header} {message.text}",
+                        reply_to_message_id=reply_id,
+                    )
+                except Exception:
+                    sent = await bot.send_message(
+                        target_chat_id,
+                        f"{header} {message.text}",
+                    )
+                ADMIN_TICKET_MESSAGES[(target_chat_id, sent.message_id)] = {
                     "ticketId": ticket_id,
                     "botKey": ticket["botKey"],
                 }
                 continue
 
-            header_message = await bot.send_message(
-                target["chatId"], header, reply_to_message_id=reply_id
-            )
-            ADMIN_TICKET_MESSAGES[(target["chatId"], header_message.message_id)] = {
+            try:
+                header_message = await bot.send_message(
+                    target_chat_id, header, reply_to_message_id=reply_id
+                )
+            except Exception:
+                header_message = await bot.send_message(target_chat_id, header)
+            ADMIN_TICKET_MESSAGES[(target_chat_id, header_message.message_id)] = {
                 "ticketId": ticket_id,
                 "botKey": ticket["botKey"],
             }
-            copied = await bot.copy_message(
-                target["chatId"], chat_id, message.message_id, reply_to_message_id=reply_id
-            )
-            ADMIN_TICKET_MESSAGES[(target["chatId"], copied.message_id)] = {
+            try:
+                copied = await bot.copy_message(
+                    target_chat_id, chat_id, message.message_id, reply_to_message_id=reply_id
+                )
+            except Exception:
+                copied = await bot.copy_message(target_chat_id, chat_id, message.message_id)
+            ADMIN_TICKET_MESSAGES[(target_chat_id, copied.message_id)] = {
                 "ticketId": ticket_id,
                 "botKey": ticket["botKey"],
             }
@@ -974,6 +1079,8 @@ async def close_ticket_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await context.bot.send_message(
         ticket["chatId"], f"Ticket #{ticket_id} has been closed by an admin."
     )
+    for chat_id in list(WORKER_LIST_MESSAGES.keys()):
+        await refresh_worker_list(context.bot, chat_id)
 
 
 async def ban_ticket_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1001,6 +1108,8 @@ async def ban_ticket_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await context.bot.send_message(
         ticket["chatId"], "🚫 <b>Access restricted.</b>", parse_mode=ParseMode.HTML
     )
+    for chat_id in list(WORKER_LIST_MESSAGES.keys()):
+        await refresh_worker_list(context.bot, chat_id)
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,44 +1233,192 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     alias = admin_alias(update.effective_chat.id, update.effective_user.first_name or "Worker")
     alias_display = html.escape(alias)
-    open_tickets = [
-        (ticket_id, ticket)
-        for ticket_id, ticket in TICKETS.items()
-        if ticket.get("status") == "open"
-    ]
-    assigned = [
-        format_ticket_line(ticket_id, ticket)
-        for ticket_id, ticket in open_tickets
-        if ticket.get("assignedAdminId") == update.effective_chat.id
-    ]
-    unassigned = [
-        format_ticket_line(ticket_id, ticket)
-        for ticket_id, ticket in open_tickets
-        if not ticket.get("assignedAdminId")
-    ]
     lines = [
         "👷 <b>Worker Panel</b>",
         f"Alias: <b>{alias_display}</b>",
         "",
-        "Commands:",
-        "• <code>/setname &lt;alias&gt;</code>",
-        "• <code>/accept &lt;ticket_id&gt;</code>",
-        "• <code>/close &lt;ticket_id&gt; &lt;profit&gt; \"remarks\"</code>",
-        "• Use <b>Request coupon</b> on a ticket to ping Duff",
-        "",
+        "Choose an action below:",
     ]
-    if assigned:
-        lines.append("<b>Your open tickets</b>")
-        lines.extend(f"• {line}" for line in assigned[:10])
-        if len(assigned) > 10:
-            lines.append(f"...and {len(assigned) - 10} more")
-        lines.append("")
-    if unassigned:
-        lines.append("<b>Unassigned tickets</b>")
-        lines.extend(f"• {line}" for line in unassigned[:10])
-        if len(unassigned) > 10:
-            lines.append(f"...and {len(unassigned) - 10} more")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=worker_panel_keyboard()
+    )
+
+
+async def worker_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.message.chat_id):
+        return
+    alias = admin_alias(query.message.chat_id, query.from_user.first_name or "Worker")
+    alias_display = html.escape(alias)
+    text = "\n".join(
+        [
+            "👷 <b>Worker Panel</b>",
+            f"Alias: <b>{alias_display}</b>",
+            "",
+            "Choose an action below:",
+        ]
+    )
+    await query.answer()
+    try:
+        await query.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=worker_panel_keyboard()
+        )
+    except Exception:
+        await query.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=worker_panel_keyboard()
+        )
+
+
+async def worker_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.message.chat_id):
+        return
+    open_tickets = [
+        (ticket_id, ticket)
+        for ticket_id, ticket in TICKETS.items()
+        if ticket.get("status") == "open" and not ticket.get("assignedAdminId")
+    ]
+    text = "📋 <b>Open tickets</b>\nTap a ticket to accept."
+    if not open_tickets:
+        text = "📋 <b>Open tickets</b>\nNo unassigned tickets right now."
+    await query.answer()
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=worker_tickets_keyboard(open_tickets),
+        )
+    except Exception:
+        sent = await query.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=worker_tickets_keyboard(open_tickets),
+        )
+        WORKER_LIST_MESSAGES[query.message.chat_id] = sent.message_id
+    else:
+        WORKER_LIST_MESSAGES[query.message.chat_id] = query.message.message_id
+
+
+async def worker_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.message.chat_id):
+        return
+    ADMIN_PROMPTS[query.message.chat_id] = {"action": "close"}
+    await query.answer()
+    await query.message.reply_text(
+        "Send: <code>&lt;ticket_id&gt; &lt;profit&gt; \"remarks\"</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True),
+    )
+
+
+async def worker_alias_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.message.chat_id):
+        return
+    ADMIN_PROMPTS[query.message.chat_id] = {"action": "alias"}
+    await query.answer()
+    await query.message.reply_text(
+        "Send your new alias.", reply_markup=ForceReply(selective=True)
+    )
+
+
+async def accept_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.message.chat_id):
+        return
+    ticket_id = int(query.data.split(":", 1)[1])
+    alias = admin_alias(query.message.chat_id, query.from_user.first_name or "Worker")
+    result = assign_ticket(ticket_id, query.message.chat_id, alias)
+    if not result["ok"]:
+        await query.answer(
+            "Ticket already accepted." if result["reason"] == "assigned" else "Ticket not found."
+        )
+        return
+    await query.answer("Ticket accepted.")
+    await update_admin_ticket_messages(context.bot, ticket_id, query.message.chat_id)
+    for chat_id in list(WORKER_LIST_MESSAGES.keys()):
+        await refresh_worker_list(context.bot, chat_id)
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=admin_ticket_keyboard(ticket_id, include_accept=False)
+        )
+    except Exception:
+        pass
+
+
+async def close_ticket_with_values(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_id: int, profit: float, remarks: str):
+    ticket = TICKETS.get(ticket_id)
+    if ticket and ticket.get("status") == "closed":
+        await update.message.reply_text("Ticket already closed.")
+        return
+    duff_cut = round(profit * DUFF_CUT_RATE, 2)
+    if not close_ticket_record(
+        ticket_id,
+        {
+            "closeType": "admin_close",
+            "remarks": remarks,
+            "closedBy": admin_alias(update.effective_chat.id, update.effective_user.first_name or "Admin"),
+            "profit": profit,
+            "duffCut": duff_cut,
+        },
+    ):
+        await update.message.reply_text("Ticket not found.")
+        return
+
+    chat_id = ticket["chatId"] if ticket else TICKET_RECORDS.get(ticket_id, {}).get("chatId")
+    if ticket:
+        ticket["status"] = "closed"
+        TICKETS[ticket_id] = ticket
+    if chat_id:
+        CUSTOMER_TICKETS.pop(chat_id, None)
+        await context.bot.send_message(chat_id, f"Ticket #{ticket_id} has been closed.")
+    await update.message.reply_text(
+        f"Ticket #{ticket_id} closed. Profit: ${profit:.2f} · Duff: ${duff_cut:.2f}"
+    )
+    if DUFF_CHAT_IDS:
+        for duff_id in DUFF_CHAT_IDS:
+            try:
+                await context.bot.send_message(
+                    duff_id,
+                    f"✅ Ticket #{ticket_id} closed.\nProfit: ${profit:.2f}\nDuff 25%: ${duff_cut:.2f}",
+                )
+            except Exception:
+                continue
+
+
+async def admin_prompt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not is_admin(update.effective_chat.id):
+        return
+    prompt = ADMIN_PROMPTS.get(update.effective_chat.id)
+    if not prompt:
+        return
+    if update.message.reply_to_message:
+        key = (update.effective_chat.id, update.message.reply_to_message.message_id)
+        if key in ADMIN_TICKET_MESSAGES:
+            return
+    action = prompt.get("action")
+    if action == "alias":
+        alias = update.message.text.strip()
+        if not alias:
+            await update.message.reply_text("Alias cannot be empty.")
+            return
+        ADMIN_ALIASES[update.effective_chat.id] = alias
+        save_config()
+        ADMIN_PROMPTS.pop(update.effective_chat.id, None)
+        await update.message.reply_text(f"Alias set to: {alias}")
+        raise ApplicationHandlerStop()
+    if action == "close":
+        raw_text = update.message.text.strip()
+        payload = raw_text if raw_text.lower().startswith("/close") else f"/close {raw_text}"
+        parsed = parse_close_payload(payload)
+        if not parsed:
+            await update.message.reply_text('Usage: <ticket_id> <profit> "remarks"')
+            return
+        ticket_id, profit, remarks = parsed
+        ADMIN_PROMPTS.pop(update.effective_chat.id, None)
+        await close_ticket_with_values(update, context, ticket_id, profit, remarks)
+        raise ApplicationHandlerStop()
 
 
 async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1184,28 +1441,95 @@ async def accept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /accept <ticket_id>")
         return
     ticket_id = int(parts[1])
+    alias = admin_alias(update.effective_chat.id, update.effective_user.first_name or "Worker")
+    result = assign_ticket(ticket_id, update.effective_chat.id, alias)
+    if not result["ok"]:
+        if result["reason"] == "assigned":
+            await update.message.reply_text("Ticket already accepted by another worker.")
+        else:
+            await update.message.reply_text("Ticket not found or already closed.")
+        return
+    await update.message.reply_text(f"Ticket #{ticket_id} accepted as {alias}.")
+    await update_admin_ticket_messages(context.bot, ticket_id, update.effective_chat.id)
+    for chat_id in list(WORKER_LIST_MESSAGES.keys()):
+        await refresh_worker_list(context.bot, chat_id)
+
+
+def assign_ticket(ticket_id: int, admin_id: int, alias: str):
     ticket = TICKETS.get(ticket_id)
     if not ticket or ticket.get("status") != "open":
-        await update.message.reply_text("Ticket not found or already closed.")
-        return
+        return {"ok": False, "reason": "not_found"}
     current_owner = ticket.get("assignedAdminId")
-    if current_owner and current_owner != update.effective_chat.id:
-        await update.message.reply_text("Ticket already accepted by another worker.")
-        return
-    alias = admin_alias(update.effective_chat.id, update.effective_user.first_name or "Worker")
-    ticket["assignedAdminId"] = update.effective_chat.id
+    if current_owner and current_owner != admin_id:
+        return {"ok": False, "reason": "assigned"}
+    ticket["assignedAdminId"] = admin_id
     ticket["assignedAlias"] = alias
     ticket["acceptedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     TICKETS[ticket_id] = ticket
     update_ticket_record(
         ticket_id,
         {
-            "assignedAdminId": update.effective_chat.id,
+            "assignedAdminId": admin_id,
             "assignedAlias": alias,
             "acceptedAt": ticket["acceptedAt"],
         },
     )
-    await update.message.reply_text(f"Ticket #{ticket_id} accepted as {alias}.")
+    return {"ok": True, "ticket": ticket}
+
+
+async def update_admin_ticket_messages(bot, ticket_id: int, accepted_chat_id: int):
+    ticket = TICKETS.get(ticket_id)
+    if not ticket:
+        return
+    entries = ticket.get("adminMessages") or []
+    kept_entries = []
+    for entry in entries:
+        chat_id = entry.get("chatId")
+        message_id = entry.get("messageId")
+        if not chat_id or not message_id:
+            continue
+        if chat_id != accepted_chat_id:
+            try:
+                await bot.delete_message(chat_id, message_id)
+                continue
+            except Exception:
+                pass
+        if chat_id == accepted_chat_id:
+            kept_entries.append(entry)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=admin_ticket_keyboard(ticket_id, include_accept=False),
+            )
+        except Exception:
+            continue
+    ticket["adminMessages"] = kept_entries
+    TICKETS[ticket_id] = ticket
+
+
+async def refresh_worker_list(bot, chat_id: int):
+    message_id = WORKER_LIST_MESSAGES.get(chat_id)
+    if not message_id:
+        return
+    open_tickets = [
+        (ticket_id, ticket)
+        for ticket_id, ticket in TICKETS.items()
+        if ticket.get("status") == "open" and not ticket.get("assignedAdminId")
+    ]
+    text = "📋 <b>Open tickets</b>\nTap a ticket to accept."
+    if not open_tickets:
+        text = "📋 <b>Open tickets</b>\nNo unassigned tickets right now."
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=worker_tickets_keyboard(open_tickets),
+        )
+    except Exception:
+        pass
 
 
 async def coupon_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1408,8 +1732,9 @@ def register_bot(application, bot_key: str):
     application.bot_data["store"] = SessionStore(application.bot)
 
     application.add_handler(TypeHandler(Update, ban_guard), group=0)
-    application.add_handler(MessageHandler(filters.ALL, admin_reply_handler), group=1)
-    application.add_handler(MessageHandler(filters.REPLY, duff_reply_handler), group=2)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prompt_handler), group=1)
+    application.add_handler(MessageHandler(filters.ALL, admin_reply_handler), group=2)
+    application.add_handler(MessageHandler(filters.REPLY, duff_reply_handler), group=3)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -1435,6 +1760,11 @@ def register_bot(application, bot_key: str):
     application.add_handler(CallbackQueryHandler(close_ticket_callback, pattern="^close:"))
     application.add_handler(CallbackQueryHandler(ban_ticket_callback, pattern="^ban:"))
     application.add_handler(CallbackQueryHandler(coupon_request_callback, pattern="^coupon:"))
+    application.add_handler(CallbackQueryHandler(accept_callback, pattern="^accept:"))
+    application.add_handler(CallbackQueryHandler(worker_panel_callback, pattern="^worker:panel$"))
+    application.add_handler(CallbackQueryHandler(worker_view_callback, pattern="^worker:view$"))
+    application.add_handler(CallbackQueryHandler(worker_close_callback, pattern="^worker:close$"))
+    application.add_handler(CallbackQueryHandler(worker_alias_callback, pattern="^worker:alias$"))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, other_handler))
