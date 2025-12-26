@@ -1,0 +1,49 @@
+{
+  "1094145030": {
+    "name": "Klaus Mikaelson",
+    "phone": "92892842",
+    "addresses": [
+      {
+        "id": "addr1766744152783794",
+        "label": "Home",
+        "text": "Apt 102 Niggs avenue"
+      },
+      {
+        "id": "addr1766749247105774",
+        "label": "Work",
+        "text": "502 nigga singh house",
+        "name": "Nigga singh",
+        "phone": "8984849294"
+      }
+    ],
+    "defaultAddressId": "addr1766744152783794",
+    "createdAt": 1766744152783,
+    "updatedAt": 1766749255677,
+    "lastOrder": {
+      "option": "🐼 Panda Express",
+      "addressId": "addr1766749247105774",
+      "subtotal": 100,
+      "updatedAt": 1766749255677
+    }
+  },
+  "6334924480": {
+    "name": "Deuca Fucking Nigga",
+    "phone": "5551234567",
+    "addresses": [
+      {
+        "id": "addr1766743157782856",
+        "label": "Deuca Niggas Place",
+        "text": "420 Niggers Ave"
+      }
+    ],
+    "defaultAddressId": "addr1766743157782856",
+    "createdAt": 1766743157782,
+    "updatedAt": 1766743180325,
+    "lastOrder": {
+      "option": "🐼 Panda Express",
+      "addressId": "addr1766743157782856",
+      "subtotal": 40,
+      "updatedAt": 1766743180325
+    }
+  }
+}

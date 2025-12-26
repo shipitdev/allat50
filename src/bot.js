@@ -18,6 +18,110 @@ try {
   process.exit(1);
 }
 
+const dataDir = path.join(__dirname, "..", "data");
+const usersPath = path.join(dataDir, "users.json");
+const sessionsPath = path.join(dataDir, "sessions.json");
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const loadJsonFile = (filePath, fallback) => {
+  if (!fs.existsSync(filePath)) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    console.error(`[storage] Invalid JSON in ${filePath}`);
+    return fallback;
+  }
+};
+
+const usersStore = loadJsonFile(usersPath, {});
+const sessionsStore = loadJsonFile(sessionsPath, {});
+const SESSION_TTL_MS = 30 * 60 * 1000;
+let storageWriteQueue = Promise.resolve();
+const backupState = new Map();
+
+const maybeBackup = (filePath) => {
+  const stamp = new Date().toISOString().slice(0, 10);
+  if (backupState.get(filePath) === stamp) {
+    return;
+  }
+  backupState.set(filePath, stamp);
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+  } catch (err) {
+    logError("storage backup", err);
+  }
+};
+
+const atomicWriteJson = async (filePath, data) => {
+  const tmpPath = `${filePath}.tmp`;
+  maybeBackup(filePath);
+  await fs.promises.writeFile(tmpPath, JSON.stringify(data, null, 2));
+  await fs.promises.rename(tmpPath, filePath);
+};
+
+const queueWrite = async (filePath, data) => {
+  storageWriteQueue = storageWriteQueue
+    .then(() => atomicWriteJson(filePath, data))
+    .catch((err) => logError("storage write", err));
+  return storageWriteQueue;
+};
+
+const cleanupSessions = () => {
+  const now = Date.now();
+  let changed = false;
+  Object.entries(sessionsStore).forEach(([userId, session]) => {
+    const updatedAt = Number(session?.updatedAt) || 0;
+    if (!updatedAt || now - updatedAt > SESSION_TTL_MS) {
+      delete sessionsStore[userId];
+      changed = true;
+    }
+  });
+  if (changed) {
+    queueWrite(sessionsPath, sessionsStore);
+  }
+};
+
+setInterval(cleanupSessions, 5 * 60 * 1000).unref();
+
+const getUser = (userId) => usersStore[String(userId)] || null;
+const saveUser = async (userId, user) => {
+  const key = String(userId);
+  const now = Date.now();
+  user.createdAt = user.createdAt || now;
+  user.updatedAt = now;
+  usersStore[key] = user;
+  await queueWrite(usersPath, usersStore);
+};
+const deleteUser = async (userId) => {
+  delete usersStore[String(userId)];
+  await queueWrite(usersPath, usersStore);
+};
+const getSessionData = (userId) => {
+  cleanupSessions();
+  return sessionsStore[String(userId)] || null;
+};
+const saveSessionData = async (userId, session) => {
+  const key = String(userId);
+  const existing = sessionsStore[key];
+  if (!Array.isArray(session.nav) && Array.isArray(existing?.nav)) {
+    session.nav = existing.nav;
+  }
+  session.updatedAt = Date.now();
+  sessionsStore[key] = session;
+  await queueWrite(sessionsPath, sessionsStore);
+};
+const deleteSessionData = async (userId) => {
+  delete sessionsStore[String(userId)];
+  await queueWrite(sessionsPath, sessionsStore);
+};
+
 const ticketRecordsPath = (() => {
   const configured = config.ticketRecordsPath;
   if (!configured) {
@@ -145,6 +249,14 @@ const rateLimitWindowMs =
   rateLimitWindowMinutes > 0 ? rateLimitWindowMinutes * 60 * 1000 : 0;
 const rateLimitEnabled = rateLimitWindowMs > 0 && rateLimitMaxTickets > 0;
 const duffCutRate = 0.25;
+const startupTimeoutMs = Number(config.startupTimeoutMs) || 30000;
+const startupRetryBaseMs = Number(config.startupRetryBaseMs) || 5000;
+const startupRetryMaxMs = Number(config.startupRetryMaxMs) || 60000;
+const startupRetryJitterMs = Number(config.startupRetryJitterMs) || 750;
+const startupGetMeRetries = Number(config.startupGetMeRetries) || 2;
+const startupStaggerMs = Number(config.startupStaggerMs) || 500;
+const startupSkipGetMe = config.startupSkipGetMe === true;
+const startupRequireGetMe = config.startupRequireGetMe === true;
 
 const botUsernames = {
   food: config.foodBotUsername || "",
@@ -169,6 +281,16 @@ const logError = (label, err) => {
   console.error(`[${label}] ${message}`);
 };
 
+const ensureText = (value, fallback = "OK") => {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  if (!value.trim()) {
+    return fallback;
+  }
+  return value;
+};
+
 const normalizeUsername = (value) =>
   value ? String(value).replace(/^@/, "") : "";
 
@@ -177,6 +299,8 @@ const escapeHtml = (value) =>
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+
+const emphasizeHtml = (text) => `<b><i>${text}</i></b>`;
 
 const formatHybridLink = (label, url) =>
   `<a href="${url}">| ${label} |</a>`;
@@ -243,7 +367,7 @@ const FOOD_QUESTIONS = [
     key: "phone",
     label: "Phone",
     prompt:
-      "📞 <b>Phone number?</b> (will be used to receive updates about your order)",
+      "📞 <b>Phone number?</b> (US only)\nExample: 555-123-4567",
   },
 ];
 
@@ -345,16 +469,14 @@ const FLIGHT_HOME = () =>
   "<i>Domestic & International • 40% OFF</i>\n\n" +
   "🧭 <b>How it works:</b> Answer a few quick questions → connect with an agent\n" +
   "⏱️ <b>Response:</b> up to 24h\n\n" +
-  "👇 <b>Tap to start</b>" +
-  quickLinksSection();
+  "👇 <b>Tap to start</b>";
 
 const HOTEL_HOME = () =>
   "🏨 <b>Hotel Concierge</b>\n" +
   "<i>Verified stays • Premium deals</i>\n\n" +
   "🧭 <b>How it works:</b> Share your trip details → connect with an agent\n" +
   "⏱️ <b>Response:</b> up to 24h\n\n" +
-  "👇 <b>Tap to start</b>" +
-  quickLinksSection();
+  "👇 <b>Tap to start</b>";
 
 const FOOD_CATEGORIES = [
   {
@@ -410,14 +532,6 @@ const FOOD_CATEGORIES = [
     label: "🔴 Canes",
   },
   {
-    id: "restaurants",
-    label: "🍽️ Restaurants",
-  },
-  {
-    id: "dine_in",
-    label: "🍴 Dine-In",
-  },
-  {
     id: "ubereats",
     label: "🚗 UberEats",
   },
@@ -428,6 +542,14 @@ const FOOD_CATEGORIES = [
   {
     id: "grubhub",
     label: "🌭 Grubhub Delivery",
+  },
+  {
+    id: "restaurants",
+    label: "🍽️ Restaurants",
+  },
+  {
+    id: "dine_in",
+    label: "🍽️ Dine-In",
   },
   {
     id: "groceries",
@@ -443,6 +565,144 @@ const FOOD_CATEGORIES = [
   },
 ];
 
+const FOOD_CATEGORY_MAP = new Map(
+  FOOD_CATEGORIES.map((item) => [item.id, item])
+);
+
+const FOOD_MENU_ROWS = [
+  ["fast_food"],
+  ["meal_kits"],
+  ["sonic_combo"],
+  ["ihop_dennys", "panera"],
+  ["wingstop", "panda"],
+  ["five_guys", "pizza"],
+  ["chipotle", "cava"],
+  ["shake_shack", "canes"],
+  ["ubereats", "doordash"],
+  ["grubhub"],
+  ["restaurants", "dine_in"],
+  ["groceries"],
+  ["movies", "uber_rides"],
+];
+
+const FLOW_STATES = {
+  IDLE: "IDLE",
+  AWAIT_PROFILE_CHOICE: "AWAIT_PROFILE_CHOICE",
+  AWAIT_NAME: "AWAIT_NAME",
+  AWAIT_PHONE: "AWAIT_PHONE",
+  AWAIT_ADDRESS_TEXT: "AWAIT_ADDRESS_TEXT",
+  AWAIT_ADDRESS_LABEL: "AWAIT_ADDRESS_LABEL",
+  AWAIT_ADDRESS_LABEL_CUSTOM: "AWAIT_ADDRESS_LABEL_CUSTOM",
+  AWAIT_PROFILE_POST_SAVE: "AWAIT_PROFILE_POST_SAVE",
+  AWAIT_ADDRESS_PICK: "AWAIT_ADDRESS_PICK",
+  AWAIT_SUBTOTAL: "AWAIT_SUBTOTAL",
+  AWAIT_ADD_NAME: "AWAIT_ADD_NAME",
+  AWAIT_ADD_PHONE: "AWAIT_ADD_PHONE",
+  AWAIT_ADD_ADDRESS_TEXT: "AWAIT_ADD_ADDRESS_TEXT",
+  AWAIT_ADD_ADDRESS_LABEL: "AWAIT_ADD_ADDRESS_LABEL",
+  AWAIT_ADD_ADDRESS_LABEL_CUSTOM: "AWAIT_ADD_ADDRESS_LABEL_CUSTOM",
+  AWAIT_MANAGE_PICK: "AWAIT_MANAGE_PICK",
+  AWAIT_MANAGE_ACTION: "AWAIT_MANAGE_ACTION",
+  AWAIT_EDIT_ADDRESS: "AWAIT_EDIT_ADDRESS",
+  AWAIT_RENAME_LABEL: "AWAIT_RENAME_LABEL",
+  AWAIT_RENAME_LABEL_CUSTOM: "AWAIT_RENAME_LABEL_CUSTOM",
+  AWAIT_DELETE_CONFIRM: "AWAIT_DELETE_CONFIRM",
+  AWAIT_CONFIRM: "AWAIT_CONFIRM",
+  AWAIT_SUPPORT: "AWAIT_SUPPORT",
+  AWAIT_LAST_ORDER: "AWAIT_LAST_ORDER",
+};
+
+const BTN_ADD_ADDRESS = "➕ Add Address";
+const BTN_MANAGE = "⚙️ Manage";
+const BTN_MANAGE_ADDR = "⚙️ Manage Addresses";
+const BTN_BACK = "⬅️ Back";
+const BTN_HOME = "🏠 Main Menu";
+const BTN_USE_DEFAULT = "✅ Use this address";
+const BTN_CHOOSE_ANOTHER = "🔁 Choose another";
+const BTN_CREATE_PROFILE = "💾 Create Profile";
+const BTN_SKIP = "Skip (this time)";
+const BTN_CHANGE_ADDRESS = "🔁 Change address";
+const BTN_PROFILE = "👤 My Profile";
+const BTN_CHOOSE_ADDRESS = "📍 Choose Address";
+const BTN_DELETE_PROFILE = "🗑️ Delete Profile";
+const BTN_SET_DEFAULT = "✅ Set Default";
+const BTN_EDIT_ADDRESS = "✏️ Edit Address";
+const BTN_RENAME_LABEL = "🏷️ Rename Label";
+const BTN_DELETE_ADDRESS = "🗑️ Delete";
+const BTN_DELETE_CONFIRM = "✅ Yes, delete";
+const BTN_DELETE_CANCEL = "❌ Cancel";
+const BTN_SUBMIT_ORDER = "✅ Submit Order";
+const BTN_EDIT_SUBTOTAL = "✏️ Edit Subtotal";
+const BTN_CANCEL_ORDER = "❌ Cancel";
+const BTN_NEW_ORDER = "🆕 New Order";
+const BTN_LAST_ORDER = "🧾 Last Order";
+const BTN_SUPPORT = "🆘 Support";
+const BTN_CHANNEL = "📢 Channel";
+const BTN_REORDER_SAME = "🔁 Reorder (same address)";
+const BTN_REORDER_CHOOSE = "🔁 Reorder (choose address)";
+const BTN_CHANGE_SUBTOTAL = "✏️ Edit subtotal";
+const BTN_ADDRESSES = "📍 Addresses";
+const BTN_MENU = "☰ Menu";
+const BTN_ADD_PROFILE_ADDR = "➕ Add Profile/Address";
+const BTN_EDIT_PROFILE_ADDR = "✏️ Edit/Delete Profile/Address";
+
+const SCREEN = {
+  HOME: "HOME",
+  QUICK_ACTIONS: "QUICK_ACTIONS",
+  PROFILE_MENU: "PROFILE_MENU",
+  PROFILE_CREATE: "PROFILE_CREATE",
+  ADDRESS_PICKER: "ADDRESS_PICKER",
+  MANAGE_ADDRESSES: "MANAGE_ADDRESSES",
+  MANAGE_ADDRESS: "MANAGE_ADDRESS",
+  SUBTOTAL: "SUBTOTAL",
+  CONFIRM: "CONFIRM",
+  LAST_ORDER: "LAST_ORDER",
+  SUPPORT: "SUPPORT",
+};
+
+const NAV_MAX = 10;
+
+const normalizeNav = (nav) => (Array.isArray(nav) ? nav.slice() : []);
+
+const updateNavStack = (nav, screenId) => {
+  let stack = normalizeNav(nav);
+  if (stack.length === 0) {
+    stack = [SCREEN.HOME];
+  }
+  if (!screenId) {
+    return stack;
+  }
+  if (screenId === SCREEN.HOME) {
+    return [SCREEN.HOME];
+  }
+  if (stack[stack.length - 1] !== screenId) {
+    stack.push(screenId);
+  }
+  if (stack.length > NAV_MAX) {
+    stack = stack.slice(stack.length - NAV_MAX);
+  }
+  return stack;
+};
+
+const recordScreen = async (ctx, screenId) => {
+  if (ctx.state?.skipNav) {
+    return;
+  }
+  const userId = ctx.from?.id;
+  if (!userId) {
+    return;
+  }
+  const session = getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} };
+  const nav = updateNavStack(session.nav, screenId);
+  await saveSessionData(userId, { ...session, nav });
+};
+
+const LABEL_HOME = "🏠 Home";
+const LABEL_WORK = "🏢 Work";
+const LABEL_OTHER = "📍 Other";
+const LABEL_CUSTOM = "✍️ Custom";
+const LABEL_CANCEL = "⬅️ Cancel";
+
 const mainMenu = () => foodMenu(false);
 
 const flightStartMenu = () =>
@@ -456,51 +716,1498 @@ const hotelStartMenu = () =>
   ]);
 
 const foodMenu = (includeBack = true) => {
-  const rows = [
-    [Markup.button.callback(FOOD_CATEGORIES[0].label, `food:${FOOD_CATEGORIES[0].id}`)],
-    [Markup.button.callback(FOOD_CATEGORIES[1].label, `food:${FOOD_CATEGORIES[1].id}`)],
-    [Markup.button.callback(FOOD_CATEGORIES[2].label, `food:${FOOD_CATEGORIES[2].id}`)],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[3].label, `food:${FOOD_CATEGORIES[3].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[4].label, `food:${FOOD_CATEGORIES[4].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[5].label, `food:${FOOD_CATEGORIES[5].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[6].label, `food:${FOOD_CATEGORIES[6].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[7].label, `food:${FOOD_CATEGORIES[7].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[8].label, `food:${FOOD_CATEGORIES[8].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[9].label, `food:${FOOD_CATEGORIES[9].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[10].label, `food:${FOOD_CATEGORIES[10].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[11].label, `food:${FOOD_CATEGORIES[11].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[12].label, `food:${FOOD_CATEGORIES[12].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[13].label, `food:${FOOD_CATEGORIES[13].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[14].label, `food:${FOOD_CATEGORIES[14].id}`),
-    ],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[15].label, `food:${FOOD_CATEGORIES[15].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[16].label, `food:${FOOD_CATEGORIES[16].id}`),
-    ],
-    [Markup.button.callback(FOOD_CATEGORIES[17].label, `food:${FOOD_CATEGORIES[17].id}`)],
-    [Markup.button.callback(FOOD_CATEGORIES[18].label, `food:${FOOD_CATEGORIES[18].id}`)],
-    [
-      Markup.button.callback(FOOD_CATEGORIES[19].label, `food:${FOOD_CATEGORIES[19].id}`),
-      Markup.button.callback(FOOD_CATEGORIES[20].label, `food:${FOOD_CATEGORIES[20].id}`),
-    ],
-  ];
+  const rows = FOOD_MENU_ROWS.map((row) =>
+    row
+      .map((id) => FOOD_CATEGORY_MAP.get(id))
+      .filter(Boolean)
+      .map((item) => Markup.button.callback(item.label, `food:${item.id}`))
+  );
 
+  rows.push([Markup.button.callback(BTN_MENU, "menu:quick")]);
   if (includeBack) {
     rows.push([Markup.button.callback("⬅️ Back to main menu", "menu:main")]);
   }
 
   return Markup.inlineKeyboard(rows);
+};
+
+const shortText = (value, max = 40) => {
+  if (!value) {
+    return "";
+  }
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max - 3).trim()}...`;
+};
+
+const normalizeLabel = (value) => (value ? value.trim() : "");
+const isHomeLabel = (label) => /^home$/i.test(label);
+const isWorkLabel = (label) => /^work$/i.test(label);
+
+const addressSlots = (user) => {
+  const addresses = Array.isArray(user?.addresses) ? user.addresses : [];
+  const home = addresses.find((addr) => isHomeLabel(addr.label));
+  const work = addresses.find((addr) => isWorkLabel(addr.label));
+  const others = addresses.filter(
+    (addr) => addr !== home && addr !== work
+  );
+  return { home, work, others };
+};
+
+const findAddressByLabel = (user, label) => {
+  const clean = normalizeLabel(label).toLowerCase();
+  const { home, work, others } = addressSlots(user);
+  const candidates = [home, work, ...others].filter(Boolean);
+  return candidates.find(
+    (addr) => normalizeLabel(addr.label).toLowerCase() === clean
+  );
+};
+
+const addressPickerKeyboard = (user) => {
+  const { home, work, others } = addressSlots(user);
+  const rows = [];
+  if (home || work) {
+    rows.push(
+      [home, work]
+        .filter(Boolean)
+        .map((addr) =>
+          Markup.button.text(
+            addr === home ? `🏠 ${addr.label}` : `🏢 ${addr.label}`
+          )
+        )
+    );
+  }
+  if (others.length) {
+    rows.push(
+      others.slice(0, 2).map((addr) => Markup.button.text(`📍 ${addr.label}`))
+    );
+  }
+  rows.push([Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE)]);
+  rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
+  return Markup.keyboard(rows).resize();
+};
+
+const singleAddressKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_USE_DEFAULT)],
+    [Markup.button.text(BTN_CHOOSE_ANOTHER), Markup.button.text(BTN_ADD_ADDRESS)],
+    [Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const profilePromptKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_CREATE_PROFILE)],
+    [Markup.button.text(BTN_SKIP)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const profileSavedKeyboard = (includeContinue = true) => {
+  const rows = [[Markup.button.text(BTN_ADD_ADDRESS)]];
+  if (includeContinue) {
+    rows.push([Markup.button.text("Continue Order")]);
+  }
+  rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
+  return Markup.keyboard(rows).resize();
+};
+
+const addressLabelKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(LABEL_HOME), Markup.button.text(LABEL_WORK)],
+    [Markup.button.text(LABEL_OTHER), Markup.button.text(LABEL_CUSTOM)],
+    [Markup.button.text(LABEL_CANCEL)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const subtotalKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_CHANGE_ADDRESS), Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const confirmOrderKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_SUBMIT_ORDER)],
+    [Markup.button.text(BTN_EDIT_SUBTOTAL)],
+    [Markup.button.text(BTN_CHANGE_ADDRESS)],
+    [Markup.button.text(BTN_CANCEL_ORDER)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const quickActionsKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_ADD_PROFILE_ADDR)],
+    [Markup.button.text(BTN_EDIT_PROFILE_ADDR)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const lastOrderKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_REORDER_SAME)],
+    [Markup.button.text(BTN_REORDER_CHOOSE)],
+    [Markup.button.text(BTN_CHANGE_SUBTOTAL)],
+    [Markup.button.text(BTN_CANCEL_ORDER)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const manageListKeyboard = (user) => {
+  const { home, work, others } = addressSlots(user);
+  const rows = [];
+  if (home || work) {
+    rows.push(
+      [home, work]
+        .filter(Boolean)
+        .map((addr) =>
+          Markup.button.text(
+            addr === home ? `🏠 ${addr.label}` : `🏢 ${addr.label}`
+          )
+        )
+    );
+  }
+  if (others.length) {
+    rows.push(
+      others.slice(0, 2).map((addr) => Markup.button.text(`📍 ${addr.label}`))
+    );
+  }
+  rows.push([Markup.button.text(BTN_ADD_ADDRESS)]);
+  rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
+  return Markup.keyboard(rows).resize();
+};
+
+const manageActionsKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_SET_DEFAULT)],
+    [Markup.button.text(BTN_EDIT_ADDRESS)],
+    [Markup.button.text(BTN_RENAME_LABEL)],
+    [Markup.button.text(BTN_DELETE_ADDRESS)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const deleteConfirmKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_DELETE_CONFIRM)],
+    [Markup.button.text(BTN_DELETE_CANCEL)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const profileKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_CHOOSE_ADDRESS)],
+    [Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_DELETE_PROFILE)],
+    [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const backHomeKeyboard = () =>
+  Markup.keyboard([[Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]]).resize();
+
+const createAddressId = (user) => {
+  const base = `addr${Date.now()}`;
+  const suffix = Math.floor(Math.random() * 1000);
+  const id = `${base}${suffix}`;
+  if (!user.addresses?.some((addr) => addr.id === id)) {
+    return id;
+  }
+  return `${base}${suffix}${Math.floor(Math.random() * 10)}`;
+};
+
+const resolveLabelChoice = (choice, user) => {
+  const label = normalizeLabel(choice);
+  if (!label) {
+    return null;
+  }
+  if (label === LABEL_HOME) {
+    return "Home";
+  }
+  if (label === LABEL_WORK) {
+    return "Work";
+  }
+  if (label === LABEL_OTHER) {
+    const addresses = user.addresses || [];
+    const others = addresses.filter(
+      (addr) => !isHomeLabel(addr.label) && !isWorkLabel(addr.label)
+    );
+    return others.length ? "Other 2" : "Other";
+  }
+  return null;
+};
+
+const stripButtonLabel = (text) => {
+  if (!text) {
+    return "";
+  }
+  const parts = text.trim().split(" ");
+  if (parts.length > 1 && ["🏠", "🏢", "📍"].includes(parts[0])) {
+    return parts.slice(1).join(" ").trim();
+  }
+  return text.trim();
+};
+
+const startLegacyFoodFlow = (ctx, optionLabel) => {
+  setSession(ctx.chat.id, {
+    service: "food",
+    stage: "food_questions",
+    stepIndex: 0,
+    answers: {},
+    foodCategory: optionLabel,
+  });
+  replyHtml(ctx, FOOD_PROMO, Markup.removeKeyboard());
+  return replyHtml(ctx, FOOD_QUESTIONS[0].prompt);
+};
+
+const sendMainMenu = async (ctx) => {
+  const userId = ctx.from?.id;
+  if (userId) {
+    const session = getSessionData(userId);
+    if (!session || session.state !== FLOW_STATES.IDLE) {
+      await saveSessionData(userId, {
+        state: FLOW_STATES.IDLE,
+        temp: {},
+        nav: session?.nav,
+      });
+    }
+  }
+  await recordScreen(ctx, SCREEN.HOME);
+  return replyHtml(ctx, "🍔 <b>Choose a food category</b>", mainMenu());
+};
+
+const sendAddressPicker = async (ctx, optionLabel, user) => {
+  const message =
+    `✅ ${optionLabel}\n\n` +
+    "📍 Choose an address:";
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+    selectedOption: optionLabel,
+    temp: { mode: "picker" },
+  });
+  await recordScreen(ctx, SCREEN.ADDRESS_PICKER);
+  return ctx.reply(message, addressPickerKeyboard(user));
+};
+
+const sendSingleAddressPrompt = async (ctx, optionLabel, user, address) => {
+  const shortAddr = shortText(address.text, 50);
+  const contactName = address.name || user.name || "-";
+  const contactPhone = address.phone || user.phone || "-";
+  const message =
+    `✅ ${optionLabel}\n\n` +
+    `👤 ${contactName}\n` +
+    `📞 ${contactPhone}\n` +
+    `📍 ${address.label}: ${shortAddr}\n\n` +
+    "Ready when you are 👇";
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+    selectedOption: optionLabel,
+    temp: { mode: "single", addressId: address.id },
+  });
+  await recordScreen(ctx, SCREEN.ADDRESS_PICKER);
+  return ctx.reply(message, singleAddressKeyboard());
+};
+
+const sendProfilePrompt = async (ctx, optionLabel) => {
+  const message =
+    `✅ ${optionLabel}\n\n` +
+    "Want 1-tap orders next time?\n" +
+    "Save your profile once (name + phone + up to 4 addresses).";
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_PROFILE_CHOICE,
+    selectedOption: optionLabel,
+    temp: {},
+  });
+  await recordScreen(ctx, SCREEN.PROFILE_CREATE);
+  return ctx.reply(message, profilePromptKeyboard());
+};
+
+const sendSubtotalPrompt = async (ctx, label, addressText, suggestedSubtotal) => {
+  const shortAddr = shortText(addressText, 50);
+  const message =
+    `✅ Using ${label}: ${shortAddr}\n\n` +
+    "✍️ Send subtotal (before tax/fees):\n" +
+    (Number.isFinite(suggestedSubtotal)
+      ? `(last: $${Number(suggestedSubtotal).toFixed(2)})\n`
+      : "") +
+    "(just type a number like 55 or $55)";
+  await recordScreen(ctx, SCREEN.SUBTOTAL);
+  return ctx.reply(message, subtotalKeyboard());
+};
+
+const sendConfirmCard = async (ctx, optionLabel, addressLabel, subtotal) => {
+  const message =
+    "🧾 Confirm order\n\n" +
+    `${optionLabel}\n` +
+    `📍 ${addressLabel}\n` +
+    `💰 Subtotal: $${subtotal.toFixed(2)}\n\n` +
+    "👇 Confirm to submit";
+  await recordScreen(ctx, SCREEN.CONFIRM);
+  return ctx.reply(message, confirmOrderKeyboard());
+};
+
+const sendQuickActions = async (ctx) => {
+  const userId = ctx.from?.id;
+  if (userId) {
+    const session = getSessionData(userId);
+    if (session && session.state !== FLOW_STATES.IDLE) {
+      await saveSessionData(userId, {
+        state: FLOW_STATES.IDLE,
+        temp: {},
+        nav: session.nav,
+      });
+    }
+  }
+  await recordScreen(ctx, SCREEN.QUICK_ACTIONS);
+  return ctx.reply("Menu", quickActionsKeyboard());
+};
+
+const sendSupportPrompt = async (ctx) => {
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_SUPPORT,
+    temp: {},
+  });
+  await recordScreen(ctx, SCREEN.SUPPORT);
+  return ctx.reply("🆘 Support\nDescribe your issue in one message.\nA human will reply.");
+};
+
+const showLastOrder = async (ctx) => {
+  const user = getUser(ctx.from.id);
+  const lastOrder = user?.lastOrder;
+  if (!lastOrder) {
+    await ctx.reply("No recent orders yet.");
+    return sendQuickActions(ctx);
+  }
+  let address = null;
+  if (lastOrder.addressId) {
+    address = (user.addresses || []).find(
+      (addr) => addr.id === lastOrder.addressId
+    );
+  }
+  const label = address?.label || lastOrder.addressLabel || "Address";
+  const addressText = address?.text || lastOrder.addressText || "";
+  if (!addressText && (user?.addresses || []).length) {
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+      selectedOption: lastOrder.option,
+      temp: {
+        lastOrder: {
+          option: lastOrder.option,
+          addressId: lastOrder.addressId || null,
+          addressLabel: label,
+          addressText: addressText,
+          subtotal: Number(lastOrder.subtotal || 0),
+        },
+        suggestedSubtotal: Number(lastOrder.subtotal || 0),
+      },
+    });
+    return sendAddressPicker(ctx, lastOrder.option, user);
+  }
+  const shortAddr = shortText(addressText, 50);
+  const message =
+    "🧾 Last order\n\n" +
+    `${lastOrder.option}\n` +
+    `📍 ${label}: ${shortAddr}\n` +
+    `💰 Subtotal: $${Number(lastOrder.subtotal || 0).toFixed(2)}`;
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_LAST_ORDER,
+    selectedOption: lastOrder.option,
+    temp: {
+      lastOrder: {
+        option: lastOrder.option,
+        addressId: lastOrder.addressId || address?.id || null,
+        addressLabel: label,
+        addressText: addressText,
+        subtotal: Number(lastOrder.subtotal || 0),
+      },
+    },
+  });
+  await recordScreen(ctx, SCREEN.LAST_ORDER);
+  return ctx.reply(message, lastOrderKeyboard());
+};
+
+const sendManageList = async (ctx, user) => {
+  const message = "⚙️ Manage your saved addresses\n(select one)";
+  await recordScreen(ctx, SCREEN.MANAGE_ADDRESSES);
+  return ctx.reply(message, manageListKeyboard(user));
+};
+
+const sendManageAddressCard = async (ctx, address) => {
+  const contactName = address.name || "-";
+  const contactPhone = address.phone || "-";
+  const message =
+    `📍 ${address.label}\n` +
+    `${address.text}\n\n` +
+    `👤 ${contactName}\n` +
+    `📞 ${contactPhone}`;
+  await recordScreen(ctx, SCREEN.MANAGE_ADDRESS);
+  return ctx.reply(message, manageActionsKeyboard());
+};
+
+const handleFoodOption = async (ctx, optionLabel) => {
+  const user = getUser(ctx.from.id);
+  if (!user) {
+    return sendProfilePrompt(ctx, optionLabel);
+  }
+  const addresses = Array.isArray(user.addresses) ? user.addresses : [];
+  if (addresses.length === 0) {
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_ADD_NAME,
+      selectedOption: optionLabel,
+      temp: { returnTo: "picker" },
+    });
+    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+  }
+  if (addresses.length === 1) {
+    return sendSingleAddressPrompt(ctx, optionLabel, user, addresses[0]);
+  }
+  return sendAddressPicker(ctx, optionLabel, user);
+};
+
+const parseSubtotal = (text) => {
+  if (!text) {
+    return null;
+  }
+  const match = text.replace(/,/g, "").match(/(\d+(\.\d+)?)/);
+  if (!match) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+};
+
+const showProfile = async (ctx) => {
+  const user = getUser(ctx.from.id);
+  if (!user) {
+    return ctx.reply(
+      "No profile saved yet.\nTap a food option and choose Create Profile."
+    );
+  }
+  const addressCount = Array.isArray(user.addresses) ? user.addresses.length : 0;
+  const defaultAddress = (user.addresses || []).find(
+    (addr) => addr.id === user.defaultAddressId
+  );
+  const contactName = defaultAddress?.name || user.name || "-";
+  const contactPhone = defaultAddress?.phone || user.phone || "-";
+  const message =
+    `👤 ${contactName}\n` +
+    `📞 ${contactPhone}\n` +
+    `📍 Saved addresses: ${addressCount}/4`;
+  await recordScreen(ctx, SCREEN.PROFILE_MENU);
+  return ctx.reply(message, profileKeyboard());
+};
+
+const finalizeOrder = async (ctx, optionLabel, user, address, subtotal) => {
+  const contactName = address.name || user.name || "-";
+  const contactPhone = address.phone || user.phone || "-";
+  const ticketId = nextTicketId();
+  tickets.set(ticketId, {
+    chatId: ctx.chat.id,
+    category: optionLabel,
+    answers: {
+      name: contactName,
+      phone: contactPhone,
+      address: address.text,
+      addressLabel: address.label,
+      subtotal: subtotal,
+    },
+    status: "open",
+    adminMessages: [],
+    botKey: "food",
+    service: "Food",
+  });
+  createTicketRecord(ticketId, {
+    service: "Food",
+    category: optionLabel,
+    chatId: ctx.chat.id,
+    botKey: "food",
+  });
+  customerTickets.set(ctx.chat.id, ticketId);
+
+  const summary = [
+    `Option: ${optionLabel}`,
+    `Name: ${contactName}`,
+    `Phone: ${contactPhone}`,
+    `Address: ${address.text}`,
+    `Subtotal: $${subtotal.toFixed(2)}`,
+  ].join("\n");
+  const userTag = ctx.from.username ? `@${ctx.from.username}` : `ID ${ctx.from.id}`;
+  const adminMessage =
+    `New food order ticket #${ticketId}\n${summary}\nCustomer: ${userTag}\n\n` +
+    "Reply to this message to chat with the customer.";
+
+  adminChatIds.forEach((chatId) => {
+    bot.telegram
+      .sendMessage(chatId, adminMessage, adminTicketKeyboard(ticketId))
+      .then((message) => {
+        adminTicketMessages.set(
+          adminMessageKey(chatId, message.message_id),
+          { ticketId, botKey: "food" }
+        );
+        const ticket = tickets.get(ticketId);
+        if (ticket) {
+          ticket.adminMessages.push({
+            chatId,
+            messageId: message.message_id,
+          });
+          tickets.set(ticketId, ticket);
+        }
+      })
+      .catch((err) => logError(`food admin notify #${ticketId}`, err));
+  });
+
+  refreshWorkerLists(ctx.telegram).catch((err) =>
+    logError("food refresh worker list", err)
+  );
+
+  if (user) {
+    const updatedUser = {
+      ...user,
+      lastOrder: {
+        option: optionLabel,
+        addressId: address.id || null,
+        subtotal: subtotal,
+        updatedAt: Date.now(),
+      },
+    };
+    await saveUser(ctx.from.id, updatedUser);
+  }
+
+  await deleteSessionData(ctx.from.id);
+  return ticketId;
+};
+
+const resolveSessionAddress = (user, session) => {
+  if (!user || !session) {
+    return null;
+  }
+  if (session.selectedAddressId) {
+    const match = (user.addresses || []).find(
+      (addr) => addr.id === session.selectedAddressId
+    );
+    if (match) {
+      return match;
+    }
+  }
+  if (session.temp?.lastOrder) {
+    return {
+      id: session.temp.lastOrder.addressId || null,
+      label: session.temp.lastOrder.addressLabel,
+      text: session.temp.lastOrder.addressText,
+    };
+  }
+  return null;
+};
+
+const renderScreen = async (ctx, screenId) => {
+  const userId = ctx.from?.id;
+  const session = userId ? getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} } : null;
+  const user = userId ? getUser(userId) : null;
+
+  if (!session || !userId) {
+    return sendMainMenu(ctx);
+  }
+
+  switch (screenId) {
+    case SCREEN.HOME:
+      return sendMainMenu(ctx);
+    case SCREEN.QUICK_ACTIONS:
+      return sendQuickActions(ctx);
+    case SCREEN.PROFILE_MENU:
+      return showProfile(ctx);
+    case SCREEN.PROFILE_CREATE:
+      if (session.selectedOption) {
+        return sendProfilePrompt(ctx, session.selectedOption);
+      }
+      return sendMainMenu(ctx);
+    case SCREEN.ADDRESS_PICKER: {
+      if (!user || !session.selectedOption) {
+        return sendMainMenu(ctx);
+      }
+      if (session.temp?.mode === "single") {
+        const addressId =
+          session.temp?.addressId || session.selectedAddressId || user.defaultAddressId;
+        const address = (user.addresses || []).find((addr) => addr.id === addressId);
+        if (address) {
+          return sendSingleAddressPrompt(ctx, session.selectedOption, user, address);
+        }
+      }
+      return sendAddressPicker(ctx, session.selectedOption, user);
+    }
+    case SCREEN.SUBTOTAL: {
+      const address = resolveSessionAddress(user, session);
+      if (!address) {
+        return sendMainMenu(ctx);
+      }
+      if (!session.selectedOption) {
+        return sendMainMenu(ctx);
+      }
+      return sendSubtotalPrompt(
+        ctx,
+        address.label,
+        address.text,
+        session.temp?.suggestedSubtotal ?? session.temp?.subtotal
+      );
+    }
+    case SCREEN.CONFIRM: {
+      const address = resolveSessionAddress(user, session);
+      if (!address) {
+        return sendMainMenu(ctx);
+      }
+      if (!session.selectedOption) {
+        return sendMainMenu(ctx);
+      }
+      const subtotal = Number(session.temp?.subtotal || 0);
+      if (!Number.isFinite(subtotal) || subtotal <= 0) {
+        return sendSubtotalPrompt(
+          ctx,
+          address.label,
+          address.text,
+          session.temp?.suggestedSubtotal
+        );
+      }
+      return sendConfirmCard(ctx, session.selectedOption, address.label, subtotal);
+    }
+    case SCREEN.MANAGE_ADDRESSES:
+      if (user) {
+        return sendManageList(ctx, user);
+      }
+      return showProfile(ctx);
+    case SCREEN.MANAGE_ADDRESS: {
+      if (!user || !session.selectedAddressId) {
+        return sendManageList(ctx, user || { addresses: [] });
+      }
+      const address = (user.addresses || []).find(
+        (addr) => addr.id === session.selectedAddressId
+      );
+      if (address) {
+        return sendManageAddressCard(ctx, address);
+      }
+      return sendManageList(ctx, user);
+    }
+    case SCREEN.LAST_ORDER:
+      return showLastOrder(ctx);
+    case SCREEN.SUPPORT:
+      return sendSupportPrompt(ctx);
+    default:
+      return sendMainMenu(ctx);
+  }
+};
+
+const handleHome = async (ctx) => {
+  resetSession(ctx.chat.id);
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.IDLE,
+    temp: {},
+    nav: [SCREEN.HOME],
+  });
+  return sendMainMenu(ctx);
+};
+
+const handleBack = async (ctx) => {
+  const userId = ctx.from.id;
+  const session = getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} };
+  const nav = normalizeNav(session.nav);
+  if (nav.length <= 1) {
+    return handleHome(ctx);
+  }
+  nav.pop();
+  await saveSessionData(userId, { ...session, nav });
+  ctx.state = ctx.state || {};
+  ctx.state.skipNav = true;
+  const target = nav[nav.length - 1] || SCREEN.HOME;
+  return renderScreen(ctx, target);
+};
+
+const handleProfileFlow = async (ctx, session) => {
+  const text = ctx.message.text.trim();
+  const userId = ctx.from.id;
+  const user = getUser(userId) || { addresses: [] };
+
+  if (text === BTN_HOME) {
+    return handleHome(ctx);
+  }
+  if (text === BTN_BACK) {
+    return handleBack(ctx);
+  }
+
+  if (text === BTN_PROFILE) {
+    return showProfile(ctx);
+  }
+
+  switch (session.state) {
+    case FLOW_STATES.AWAIT_PROFILE_CHOICE: {
+      if (text === BTN_CREATE_PROFILE) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_NAME,
+          temp: {},
+        });
+        return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+      }
+      if (text === BTN_SKIP) {
+        await deleteSessionData(userId);
+        return startLegacyFoodFlow(ctx, session.selectedOption);
+      }
+      if (text === BTN_BACK) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      return sendProfilePrompt(ctx, session.selectedOption);
+    }
+    case FLOW_STATES.AWAIT_NAME: {
+      if (!text) {
+        return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_PHONE,
+        temp: { name: text },
+      });
+      return ctx.reply(
+        "📞 Your phone number? (US only)\nExample: 555-123-4567",
+        backHomeKeyboard()
+      );
+    }
+    case FLOW_STATES.AWAIT_PHONE: {
+      if (!text) {
+        return ctx.reply(
+          "📞 Your phone number? (US only)\nExample: 555-123-4567",
+          backHomeKeyboard()
+        );
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADDRESS_TEXT,
+        temp: { ...session.temp, phone: text },
+      });
+      return ctx.reply(
+        "📍 Send your delivery address\n(include Apt/Flat + Zip + Gate code if any)",
+        backHomeKeyboard()
+      );
+    }
+    case FLOW_STATES.AWAIT_ADDRESS_TEXT: {
+      if (!text) {
+        return ctx.reply(
+          "📍 Send your delivery address\n(include Apt/Flat + Zip + Gate code if any)",
+          backHomeKeyboard()
+        );
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADDRESS_LABEL,
+        temp: { ...session.temp, addressText: text },
+      });
+      return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+    }
+    case FLOW_STATES.AWAIT_ADDRESS_LABEL: {
+      if (text === LABEL_CANCEL) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      if (text === LABEL_CUSTOM) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADDRESS_LABEL_CUSTOM,
+        });
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const label = resolveLabelChoice(text, user);
+      if (!label) {
+        return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+      }
+      const addressId = createAddressId(user);
+      const contactName = session.temp?.name || user.name || "-";
+      const contactPhone = session.temp?.phone || user.phone || "-";
+      const updated = {
+        name: session.temp?.name || user.name,
+        phone: session.temp?.phone || user.phone,
+        addresses: [
+          {
+            id: addressId,
+            label: label,
+            text: session.temp?.addressText || "",
+            name: contactName,
+            phone: contactPhone,
+          },
+        ],
+        defaultAddressId: addressId,
+      };
+      await saveUser(userId, updated);
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_PROFILE_POST_SAVE,
+        temp: {},
+      });
+      return ctx.reply(
+        "✅ Profile saved!\n\nYou can save up to 4 addresses.\nWant to add another now?",
+        profileSavedKeyboard(Boolean(session.selectedOption))
+      );
+    }
+    case FLOW_STATES.AWAIT_ADDRESS_LABEL_CUSTOM: {
+      if (!text) {
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const addressId = createAddressId(user);
+      const contactName = session.temp?.name || user.name || "-";
+      const contactPhone = session.temp?.phone || user.phone || "-";
+      const updated = {
+        name: session.temp?.name || user.name,
+        phone: session.temp?.phone || user.phone,
+        addresses: [
+          {
+            id: addressId,
+            label: text.trim(),
+            text: session.temp?.addressText || "",
+            name: contactName,
+            phone: contactPhone,
+          },
+        ],
+        defaultAddressId: addressId,
+      };
+      await saveUser(userId, updated);
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_PROFILE_POST_SAVE,
+        temp: {},
+      });
+      return ctx.reply(
+        "✅ Profile saved!\n\nYou can save up to 4 addresses.\nWant to add another now?",
+        profileSavedKeyboard(Boolean(session.selectedOption))
+      );
+    }
+    case FLOW_STATES.AWAIT_PROFILE_POST_SAVE: {
+      if (text === BTN_ADD_ADDRESS) {
+        const existing = user.addresses || [];
+        if (existing.length >= 4) {
+          return ctx.reply(
+            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+            Markup.keyboard([
+              [Markup.button.text(BTN_MANAGE_ADDR)],
+              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+            ]).resize()
+          );
+        }
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADD_NAME,
+          temp: { returnTo: "order" },
+        });
+        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+      }
+      if (text === "Continue Order") {
+        if (!session.selectedOption) {
+          await deleteSessionData(userId);
+          return sendMainMenu(ctx);
+        }
+        const refreshed = getUser(userId);
+        if (refreshed && refreshed.addresses?.length) {
+          if (refreshed.addresses.length === 1) {
+            return sendSingleAddressPrompt(
+              ctx,
+              session.selectedOption,
+              refreshed,
+              refreshed.addresses[0]
+            );
+          }
+          return sendAddressPicker(ctx, session.selectedOption, refreshed);
+        }
+      }
+      return ctx.reply(
+        "Choose an option to continue.",
+        profileSavedKeyboard(Boolean(session.selectedOption))
+      );
+    }
+    case FLOW_STATES.AWAIT_ADDRESS_PICK: {
+      if (text === BTN_BACK) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      if (text === BTN_ADD_ADDRESS) {
+        const existing = user.addresses || [];
+        if (existing.length >= 4) {
+          await saveSessionData(userId, {
+            ...session,
+            state: FLOW_STATES.AWAIT_ADD_NAME,
+            temp: { returnTo: "picker" },
+          });
+          return ctx.reply(
+            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+            Markup.keyboard([
+              [Markup.button.text(BTN_MANAGE_ADDR)],
+              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+            ]).resize()
+          );
+        }
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADD_NAME,
+          temp: { returnTo: "picker" },
+        });
+        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+      }
+      if (text === BTN_MANAGE) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+          temp: { returnTo: "picker" },
+        });
+        return sendManageList(ctx, user);
+      }
+      if (text === BTN_USE_DEFAULT || text === BTN_CHOOSE_ANOTHER) {
+        const addresses = user.addresses || [];
+        if (!addresses.length) {
+          return ctx.reply("No saved addresses yet.");
+        }
+        if (text === BTN_USE_DEFAULT) {
+          const addr =
+            addresses.find((addr) => addr.id === user.defaultAddressId) ||
+            addresses[0];
+          await saveSessionData(userId, {
+            ...session,
+            state: FLOW_STATES.AWAIT_SUBTOTAL,
+            selectedAddressId: addr.id,
+          });
+          return sendSubtotalPrompt(
+            ctx,
+            addr.label,
+            addr.text,
+            session.temp?.suggestedSubtotal
+          );
+        }
+        return sendAddressPicker(ctx, session.selectedOption, user);
+      }
+      if (text === BTN_MANAGE_ADDR) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+          temp: { returnTo: "picker" },
+        });
+        return sendManageList(ctx, user);
+      }
+      const chosenLabel = stripButtonLabel(text);
+      const address = findAddressByLabel(user, chosenLabel);
+      if (!address) {
+        return ctx.reply("📍 Choose an address:", addressPickerKeyboard(user));
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_SUBTOTAL,
+        selectedAddressId: address.id,
+      });
+      return sendSubtotalPrompt(
+        ctx,
+        address.label,
+        address.text,
+        session.temp?.suggestedSubtotal
+      );
+    }
+    case FLOW_STATES.AWAIT_ADD_NAME: {
+      if (!text) {
+        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADD_PHONE,
+        temp: { ...session.temp, addressName: text },
+      });
+      return ctx.reply(
+        "📞 Phone for this address? (US only)\nExample: 555-123-4567",
+        backHomeKeyboard()
+      );
+    }
+    case FLOW_STATES.AWAIT_ADD_PHONE: {
+      if (!text) {
+        return ctx.reply(
+          "📞 Phone for this address? (US only)\nExample: 555-123-4567",
+          backHomeKeyboard()
+        );
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADD_ADDRESS_TEXT,
+        temp: { ...session.temp, addressPhone: text },
+      });
+      return ctx.reply(
+        "📍 Send the new address\n(include Apt/Zip/Gate code)",
+        backHomeKeyboard()
+      );
+    }
+    case FLOW_STATES.AWAIT_ADD_ADDRESS_TEXT: {
+      const existing = user.addresses || [];
+      if (existing.length >= 4) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+          temp: { returnTo: session.temp?.returnTo || "profile" },
+        });
+        return ctx.reply(
+          "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+          Markup.keyboard([
+            [Markup.button.text(BTN_MANAGE_ADDR)],
+            [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+          ]).resize()
+        );
+      }
+      if (!text) {
+        return ctx.reply(
+          "📍 Send the new address\n(include Apt/Zip/Gate code)",
+          backHomeKeyboard()
+        );
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL,
+        temp: { ...session.temp, addressText: text },
+      });
+      return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+    }
+    case FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL: {
+      if (text === LABEL_CANCEL) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      if (text === LABEL_CUSTOM) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL_CUSTOM,
+        });
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const label = resolveLabelChoice(text, user);
+      if (!label) {
+        return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+      }
+      const addressId = createAddressId(user);
+      const contactName =
+        session.temp?.addressName || session.temp?.name || user.name || "-";
+      const contactPhone =
+        session.temp?.addressPhone || session.temp?.phone || user.phone || "-";
+      const addresses = (user.addresses || []).concat({
+        id: addressId,
+        label: label,
+        text: session.temp?.addressText || "",
+        name: contactName,
+        phone: contactPhone,
+      });
+      const updated = {
+        ...user,
+        addresses,
+        defaultAddressId: user.defaultAddressId || addressId,
+      };
+      await saveUser(userId, updated);
+      const refreshed = getUser(userId);
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+      });
+      await ctx.reply("✅ Address added.\nPick an address to continue:");
+      if (refreshed) {
+        return sendAddressPicker(ctx, session.selectedOption, refreshed);
+      }
+      return sendMainMenu(ctx);
+    }
+    case FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL_CUSTOM: {
+      if (!text) {
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const addressId = createAddressId(user);
+      const contactName =
+        session.temp?.addressName || session.temp?.name || user.name || "-";
+      const contactPhone =
+        session.temp?.addressPhone || session.temp?.phone || user.phone || "-";
+      const addresses = (user.addresses || []).concat({
+        id: addressId,
+        label: text.trim(),
+        text: session.temp?.addressText || "",
+        name: contactName,
+        phone: contactPhone,
+      });
+      const updated = {
+        ...user,
+        addresses,
+        defaultAddressId: user.defaultAddressId || addressId,
+      };
+      await saveUser(userId, updated);
+      const refreshed = getUser(userId);
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+      });
+      await ctx.reply("✅ Address added.\nPick an address to continue:");
+      if (refreshed) {
+        return sendAddressPicker(ctx, session.selectedOption, refreshed);
+      }
+      return sendMainMenu(ctx);
+    }
+    case FLOW_STATES.AWAIT_MANAGE_PICK: {
+      if (text === BTN_BACK) {
+        await deleteSessionData(userId);
+        if (session.temp?.returnTo === "picker" && session.selectedOption) {
+          return sendAddressPicker(ctx, session.selectedOption, user);
+        }
+        return showProfile(ctx);
+      }
+      if (text === BTN_MANAGE_ADDR) {
+        return sendManageList(ctx, user);
+      }
+      if (text === BTN_ADD_ADDRESS) {
+        const existing = user.addresses || [];
+        if (existing.length >= 4) {
+          return ctx.reply(
+            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+            Markup.keyboard([
+              [Markup.button.text(BTN_MANAGE_ADDR)],
+              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+            ]).resize()
+          );
+        }
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADD_NAME,
+          temp: { returnTo: session.temp?.returnTo || "profile" },
+        });
+        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+      }
+      const chosenLabel = stripButtonLabel(text);
+      const address = findAddressByLabel(user, chosenLabel);
+      if (!address) {
+        return sendManageList(ctx, user);
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_MANAGE_ACTION,
+        selectedAddressId: address.id,
+      });
+      return sendManageAddressCard(ctx, address);
+    }
+    case FLOW_STATES.AWAIT_MANAGE_ACTION: {
+      const address = (user.addresses || []).find(
+        (addr) => addr.id === session.selectedAddressId
+      );
+      if (!address) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        });
+        return sendManageList(ctx, user);
+      }
+      if (text === BTN_SET_DEFAULT) {
+        await saveUser(userId, { ...user, defaultAddressId: address.id });
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        });
+        await ctx.reply("✅ Default address updated.");
+        return sendManageList(ctx, getUser(userId));
+      }
+      if (text === BTN_EDIT_ADDRESS) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_EDIT_ADDRESS,
+        });
+        return ctx.reply("✏️ Send the updated address text:", backHomeKeyboard());
+      }
+      if (text === BTN_RENAME_LABEL) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_RENAME_LABEL,
+        });
+        return ctx.reply("🏷️ Choose a new label:", addressLabelKeyboard());
+      }
+      if (text === BTN_DELETE_ADDRESS) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_DELETE_CONFIRM,
+        });
+        return ctx.reply("🗑️ Delete this address?", deleteConfirmKeyboard());
+      }
+      if (text === BTN_BACK) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        });
+        return sendManageList(ctx, user);
+      }
+      return sendManageAddressCard(ctx, address);
+    }
+    case FLOW_STATES.AWAIT_EDIT_ADDRESS: {
+      if (!text) {
+        return ctx.reply("✏️ Send the updated address text:", backHomeKeyboard());
+      }
+      const addresses = (user.addresses || []).map((addr) =>
+        addr.id === session.selectedAddressId
+          ? { ...addr, text: text.trim() }
+          : addr
+      );
+      await saveUser(userId, { ...user, addresses });
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      });
+      await ctx.reply("✅ Address updated.");
+      return sendManageList(ctx, getUser(userId));
+    }
+    case FLOW_STATES.AWAIT_RENAME_LABEL: {
+      if (text === LABEL_CANCEL) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_ACTION,
+        });
+        return sendManageAddressCard(
+          ctx,
+          (user.addresses || []).find(
+            (addr) => addr.id === session.selectedAddressId
+          )
+        );
+      }
+      if (text === LABEL_CUSTOM) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_RENAME_LABEL_CUSTOM,
+        });
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const label = resolveLabelChoice(text, user);
+      if (!label) {
+        return ctx.reply("🏷️ Choose a new label:", addressLabelKeyboard());
+      }
+      const addresses = (user.addresses || []).map((addr) =>
+        addr.id === session.selectedAddressId
+          ? { ...addr, label }
+          : addr
+      );
+      await saveUser(userId, { ...user, addresses });
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      });
+      await ctx.reply("✅ Label updated.");
+      return sendManageList(ctx, getUser(userId));
+    }
+    case FLOW_STATES.AWAIT_RENAME_LABEL_CUSTOM: {
+      if (!text) {
+        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+      }
+      const addresses = (user.addresses || []).map((addr) =>
+        addr.id === session.selectedAddressId
+          ? { ...addr, label: text.trim() }
+          : addr
+      );
+      await saveUser(userId, { ...user, addresses });
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      });
+      await ctx.reply("✅ Label updated.");
+      return sendManageList(ctx, getUser(userId));
+    }
+    case FLOW_STATES.AWAIT_DELETE_CONFIRM: {
+      if (text === BTN_DELETE_CANCEL) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        });
+        return sendManageList(ctx, user);
+      }
+      if (text !== BTN_DELETE_CONFIRM) {
+        return ctx.reply("🗑️ Delete this address?", deleteConfirmKeyboard());
+      }
+      const addresses = (user.addresses || []).filter(
+        (addr) => addr.id !== session.selectedAddressId
+      );
+      const defaultAddressId =
+        user.defaultAddressId === session.selectedAddressId
+          ? addresses[0]?.id || null
+          : user.defaultAddressId;
+      await saveUser(userId, { ...user, addresses, defaultAddressId });
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      });
+      await ctx.reply("✅ Address deleted.");
+      return sendManageList(ctx, getUser(userId));
+    }
+    case FLOW_STATES.AWAIT_SUBTOTAL: {
+      if (text === BTN_CHANGE_ADDRESS) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+        });
+        return sendAddressPicker(ctx, session.selectedOption, user);
+      }
+      if (text === BTN_MANAGE) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_MANAGE_PICK,
+          temp: { returnTo: "picker" },
+        });
+        return sendManageList(ctx, user);
+      }
+      if (text === BTN_BACK) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      const subtotal = parseSubtotal(text);
+      if (subtotal === null) {
+        return ctx.reply(
+          "✍️ Send subtotal (before tax/fees):\n(just type a number like 55 or $55)",
+          subtotalKeyboard()
+        );
+      }
+      let address = null;
+      if (session.selectedAddressId) {
+        address = (user.addresses || []).find(
+          (addr) => addr.id === session.selectedAddressId
+        );
+      }
+      if (!address && session.temp?.lastOrder) {
+        address = {
+          id: session.temp.lastOrder.addressId,
+          label: session.temp.lastOrder.addressLabel,
+          text: session.temp.lastOrder.addressText,
+        };
+      }
+      if (!address) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      await saveSessionData(userId, {
+        ...session,
+        state: FLOW_STATES.AWAIT_CONFIRM,
+        temp: {
+          ...session.temp,
+          subtotal,
+        },
+      });
+      return sendConfirmCard(
+        ctx,
+        session.selectedOption,
+        address.label,
+        subtotal
+      );
+    }
+    case FLOW_STATES.AWAIT_CONFIRM: {
+      let address = null;
+      if (session.selectedAddressId) {
+        address = (user.addresses || []).find(
+          (addr) => addr.id === session.selectedAddressId
+        );
+      }
+      if (!address && session.temp?.lastOrder) {
+        address = {
+          id: session.temp.lastOrder.addressId,
+          label: session.temp.lastOrder.addressLabel,
+          text: session.temp.lastOrder.addressText,
+        };
+      }
+      if (!address) {
+        await deleteSessionData(userId);
+        return sendMainMenu(ctx);
+      }
+      if (text === BTN_SUBMIT_ORDER) {
+        const subtotal = Number(session.temp?.subtotal || 0);
+        await finalizeOrder(ctx, session.selectedOption, user, address, subtotal);
+        await ctx.reply(
+          "✅ Submitted!\n\n⏳ Matching you with a concierge...\n⏱ Avg response: 1–5 mins",
+          Markup.removeKeyboard()
+        );
+        return;
+      }
+      if (text === BTN_EDIT_SUBTOTAL) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_SUBTOTAL,
+        });
+        return sendSubtotalPrompt(
+          ctx,
+          address.label,
+          address.text,
+          session.temp?.subtotal
+        );
+      }
+      if (text === BTN_CHANGE_ADDRESS) {
+        await saveSessionData(userId, {
+          ...session,
+          state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+        });
+        return sendAddressPicker(ctx, session.selectedOption, user);
+      }
+      if (text === BTN_CANCEL_ORDER) {
+        await deleteSessionData(userId);
+        await ctx.reply("❌ Canceled.", Markup.removeKeyboard());
+        return sendQuickActions(ctx);
+      }
+      return sendConfirmCard(
+        ctx,
+        session.selectedOption,
+        address.label,
+        Number(session.temp?.subtotal || 0)
+      );
+    }
+    case FLOW_STATES.AWAIT_LAST_ORDER: {
+      const lastOrder = session.temp?.lastOrder;
+      if (!lastOrder) {
+        await deleteSessionData(userId);
+        return sendQuickActions(ctx);
+      }
+      if (text === BTN_REORDER_SAME) {
+        await saveSessionData(userId, {
+          state: FLOW_STATES.AWAIT_SUBTOTAL,
+          selectedOption: lastOrder.option,
+          selectedAddressId: lastOrder.addressId || null,
+          temp: { lastOrder: lastOrder, suggestedSubtotal: lastOrder.subtotal },
+        });
+        return sendSubtotalPrompt(
+          ctx,
+          lastOrder.addressLabel,
+          lastOrder.addressText,
+          lastOrder.subtotal
+        );
+      }
+      if (text === BTN_REORDER_CHOOSE) {
+        await saveSessionData(userId, {
+          state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+          selectedOption: lastOrder.option,
+          temp: { lastOrder: lastOrder, suggestedSubtotal: lastOrder.subtotal },
+        });
+        return sendAddressPicker(ctx, lastOrder.option, user);
+      }
+      if (text === BTN_CHANGE_SUBTOTAL) {
+        await saveSessionData(userId, {
+          state: FLOW_STATES.AWAIT_SUBTOTAL,
+          selectedOption: lastOrder.option,
+          selectedAddressId: lastOrder.addressId || null,
+          temp: { lastOrder: lastOrder, suggestedSubtotal: lastOrder.subtotal },
+        });
+        return sendSubtotalPrompt(
+          ctx,
+          lastOrder.addressLabel,
+          lastOrder.addressText,
+          lastOrder.subtotal
+        );
+      }
+      if (text === BTN_CANCEL_ORDER) {
+        await deleteSessionData(userId);
+        return sendQuickActions(ctx);
+      }
+      return showLastOrder(ctx);
+    }
+    case FLOW_STATES.AWAIT_SUPPORT: {
+      if (!text) {
+        return ctx.reply("Describe your issue in one message.");
+      }
+      const userTag = ctx.from.username
+        ? `@${ctx.from.username}`
+        : `ID ${ctx.from.id}`;
+      adminChatIds.forEach((chatId) => {
+        bot.telegram
+          .sendMessage(chatId, `🆘 Support request from ${userTag}\n${text}`)
+          .catch((err) => logError("support notify", err));
+      });
+      await deleteSessionData(userId);
+      await ctx.reply("✅ Thanks! A human will reply shortly.");
+      return sendQuickActions(ctx);
+    }
+    default:
+      return null;
+  }
 };
 
 const confirmMenu = () =>
@@ -590,9 +2297,14 @@ const ticketBrief = (ticket) => {
 const formatTicketLine = (ticketId, ticket) => {
   const serviceLabel = escapeHtml(ticket.service || ticket.category || "Order");
   const assigned = escapeHtml(ticket.assignedAlias || "Unassigned");
-  const couponState = ticket.couponRequested ? "Coupon requested" : "No coupon";
-  return `#${ticketId} ${serviceLabel} · ${assigned} · ${couponState}`;
+  const logState = ticket.couponRequested ? "Log requested" : "No log";
+  return `#${ticketId} ${serviceLabel} · ${assigned} · ${logState}`;
 };
+
+const completionThankYou = (ticketId) =>
+  `${emphasizeHtml(`Order #${ticketId} complete.`)}\n${emphasizeHtml(
+    "Thank you for choosing Allat50. We appreciate your business."
+  )}`;
 
 const formatClosedLine = (ticketId, record) => {
   const profit = Number(record.profit) || 0;
@@ -617,10 +2329,11 @@ const adminTicketKeyboard = (ticketId, includeAccept = true) => {
     rows.push([Markup.button.callback("✅ Accept order", `accept:${ticketId}`)]);
   }
   rows.push([
+    Markup.button.callback("💳 Mark paid", `paid:${ticketId}`),
     Markup.button.callback("🛑 Close ticket", `close:${ticketId}`),
     Markup.button.callback("🚫 Ban customer", `ban:${ticketId}`),
   ]);
-  rows.push([Markup.button.callback("🎟️ Request coupon", `coupon:${ticketId}`)]);
+  rows.push([Markup.button.callback("📝 Request log", `coupon:${ticketId}`)]);
   return Markup.inlineKeyboard(rows);
 };
 
@@ -742,7 +2455,9 @@ const closeTicketsForChat = (chatId, closeType, closedBy) => {
 
 const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
   const customerLabel = ctx.from.first_name || "Customer";
-  const header = `Customer (${customerLabel}) on ticket #${ticketId}:`;
+  const safeHeader = emphasizeHtml(
+    `Customer (${escapeHtml(customerLabel)}) on ticket #${ticketId}`
+  );
   const assignedId = ticket.assignedAdminId;
   let targets = [];
   if (assignedId) {
@@ -765,10 +2480,14 @@ const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
     const replyId = target.messageId;
     if (ctx.message.text) {
       try {
+        const payload = { parse_mode: "HTML" };
+        if (replyId) {
+          payload.reply_to_message_id = replyId;
+        }
         const message = await telegram.sendMessage(
           target.chatId,
-          `${header} ${ctx.message.text}`,
-          replyId ? { reply_to_message_id: replyId } : undefined
+          `${safeHeader} ${escapeHtml(ctx.message.text)}`,
+          payload
         );
         adminTicketMessages.set(
           adminMessageKey(target.chatId, message.message_id),
@@ -777,9 +2496,11 @@ const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
       } catch (_) {
         if (replyId) {
           try {
+            const payload = { parse_mode: "HTML" };
             const message = await telegram.sendMessage(
               target.chatId,
-              `${header} ${ctx.message.text}`
+              `${safeHeader} ${escapeHtml(ctx.message.text)}`,
+              payload
             );
             adminTicketMessages.set(
               adminMessageKey(target.chatId, message.message_id),
@@ -792,10 +2513,14 @@ const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
     }
 
     try {
+      const payload = { parse_mode: "HTML" };
+      if (replyId) {
+        payload.reply_to_message_id = replyId;
+      }
       const headerMessage = await telegram.sendMessage(
         target.chatId,
-        header,
-        replyId ? { reply_to_message_id: replyId } : undefined
+        safeHeader,
+        payload
       );
       adminTicketMessages.set(
         adminMessageKey(target.chatId, headerMessage.message_id),
@@ -814,9 +2539,11 @@ const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
     } catch (_) {
       if (replyId) {
         try {
+          const payload = { parse_mode: "HTML" };
           const headerMessage = await telegram.sendMessage(
             target.chatId,
-            header
+            safeHeader,
+            payload
           );
           adminTicketMessages.set(
             adminMessageKey(target.chatId, headerMessage.message_id),
@@ -983,14 +2710,19 @@ const checkRateLimit = (userId) => {
 
 bot.start((ctx) => {
   resetSession(ctx.chat.id);
+  saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.IDLE,
+    temp: {},
+    nav: [SCREEN.HOME],
+  }).catch((err) => logError("clear profile session", err));
   return sendHome(
     ctx,
-    "👋 <b>Foodbot Concierge</b>\n<i>Food Orders • Flight Bookings • Hotel Bookings</i>\n\n" +
-      "🟢 <b>Status:</b> Up\n" +
-      "🎯 <b>How it works:</b> Pick a service → answer a few questions → connect with an agent\n" +
-      "🔥 <b>Promos:</b> Food 50% off · Flights 40% off\n\n" +
-      "👇 <b>Tap a food category to begin</b>" +
-      quickLinksSection(),
+    "👋 Allat50 Foodbot\n\n" +
+      "🍔 Food • ✈️ Flights • 🏨 Hotels\n\n" +
+      "🟢 Online — real agents only\n" +
+      "⏱ Avg response: 1-5 mins\n" +
+      "💸 Savings: easy 50%\n\n" +
+    "👇 Pick a service to begin",
     mainMenu()
   );
 });
@@ -1004,6 +2736,9 @@ bot.command("help", (ctx) =>
 
 bot.command("cancel", (ctx) => {
   resetSession(ctx.chat.id);
+  deleteSessionData(ctx.from.id).catch((err) =>
+    logError("clear profile session", err)
+  );
   return replyHtml(
     ctx,
     "🛑 <b>Canceled.</b> Send /start when you're ready."
@@ -1084,7 +2819,9 @@ const closeTicketWithValues = (ctx, ticketId, profit, remarks) => {
   }
   if (chatId) {
     customerTickets.delete(chatId);
-    ctx.telegram.sendMessage(chatId, `Ticket #${ticketId} has been closed.`).catch(() => {});
+    ctx.telegram
+      .sendMessage(chatId, completionThankYou(ticketId), { parse_mode: "HTML" })
+      .catch(() => {});
   }
 
   if (duffChatIds.length > 0) {
@@ -1180,12 +2917,19 @@ const registerAdminReplyHandler = (botInstance, botKey) => {
     if (ctx.message.text) {
       await ctx.telegram.sendMessage(
         ticket.chatId,
-        `${adminLabel}: ${ctx.message.text}`
+        `${emphasizeHtml(escapeHtml(adminLabel))}: ${escapeHtml(
+          ctx.message.text
+        )}`,
+        { parse_mode: "HTML" }
       );
       return;
     }
 
-    await ctx.telegram.sendMessage(ticket.chatId, `${adminLabel} sent:`);
+    await ctx.telegram.sendMessage(
+      ticket.chatId,
+      `${emphasizeHtml(escapeHtml(adminLabel))} sent:`,
+      { parse_mode: "HTML" }
+    );
     return ctx.telegram.copyMessage(
       ticket.chatId,
       ctx.chat.id,
@@ -1224,27 +2968,31 @@ const registerDuffReplyHandler = (botInstance) => {
       return;
     }
 
-    const couponText = ctx.message?.text;
-    if (!couponText) {
-      await ctx.reply("Please send coupon text.");
+    const logText = ctx.message?.text;
+    if (!logText) {
+      await ctx.reply("Please send log text.");
       return;
     }
 
     const duffName = ctx.from?.first_name || "Duff";
     ticket.couponProvidedBy = duffName;
     ticket.couponProvidedAt = new Date().toISOString();
-    ticket.couponText = couponText;
+    ticket.couponText = logText;
     tickets.set(entry.ticketId, ticket);
     updateTicketRecord(entry.ticketId, {
       couponProvidedBy: duffName,
       couponProvidedAt: ticket.couponProvidedAt,
     });
 
+    const safeLog = escapeHtml(logText);
     await ctx.telegram.sendMessage(
       adminId,
-      `🎟️ Duff coupon for ticket #${entry.ticketId}:\n${couponText}`
+      `${emphasizeHtml(`Log for ticket #${entry.ticketId}`)}\n<code>${safeLog}</code>`,
+      { parse_mode: "HTML" }
     );
-    await ctx.reply("Coupon sent to the worker.");
+    await ctx.reply(emphasizeHtml("Log sent to the worker."), {
+      parse_mode: "HTML",
+    });
   });
 };
 
@@ -1331,6 +3079,11 @@ const workerAliasAction = async (ctx) => {
 
 const adminPromptHandler = async (ctx, next) => {
   if (!isAdminChat(ctx)) {
+    return next();
+  }
+  const flowSession = getSessionData(ctx.from.id);
+  const legacySession = sessions.get(ctx.chat.id);
+  if ((flowSession && flowSession.state !== FLOW_STATES.IDLE) || legacySession) {
     return next();
   }
   const prompt = adminPrompts.get(ctx.chat.id);
@@ -1498,13 +3251,13 @@ const duffPanel = (ctx) => {
     `🧮 Duff 25%: <b>$${totals.duffTotal.toFixed(2)}</b>`,
     "",
     "Commands:",
-    "• <code>/coupon &lt;ticket_id&gt; &lt;coupon text&gt;</code>",
-    "• Reply to a coupon request to send the coupon",
+    "• <code>/log &lt;ticket_id&gt; &lt;log text&gt;</code>",
+    "• Reply to a log request to send the log",
     "",
   ];
 
   if (live.length) {
-    lines.push("🟢 <b>Live coupon requests</b>");
+    lines.push("🟢 <b>Live log requests</b>");
     lines.push(...live.slice(0, 10).map((line) => `• ${line}`));
     if (live.length > 10) {
       lines.push(`...and ${live.length - 10} more`);
@@ -1531,16 +3284,16 @@ const duffPanel = (ctx) => {
   return replyHtml(ctx, lines.join("\n"));
 };
 
-const couponCommand = (ctx) => {
+const logCommand = (ctx) => {
   if (!isDuffChat(ctx)) {
     return;
   }
-  const match = ctx.message.text.trim().match(/^\/coupon\s+(\d+)\s+([\s\S]+)$/i);
+  const match = ctx.message.text.trim().match(/^\/log\s+(\d+)\s+([\s\S]+)$/i);
   if (!match) {
-    return ctx.reply("Usage: /coupon <ticket_id> <coupon text>");
+    return ctx.reply("Usage: /log <ticket_id> <log text>");
   }
   const ticketId = Number(match[1]);
-  const couponText = match[2].trim();
+  const logText = match[2].trim();
   const ticket = tickets.get(ticketId);
   if (!ticket || ticket.status !== "open") {
     return ctx.reply("Ticket not found or closed.");
@@ -1551,7 +3304,7 @@ const couponCommand = (ctx) => {
   const duffName = ctx.from?.first_name || "Duff";
   ticket.couponProvidedBy = duffName;
   ticket.couponProvidedAt = new Date().toISOString();
-  ticket.couponText = couponText;
+  ticket.couponText = logText;
   tickets.set(ticketId, ticket);
   updateTicketRecord(ticketId, {
     couponProvidedBy: duffName,
@@ -1560,10 +3313,15 @@ const couponCommand = (ctx) => {
   ctx.telegram
     .sendMessage(
       ticket.assignedAdminId,
-      `🎟️ Duff coupon for ticket #${ticketId}:\n${couponText}`
+      `${emphasizeHtml(`Log for ticket #${ticketId}`)}\n<code>${escapeHtml(
+        logText
+      )}</code>`,
+      { parse_mode: "HTML" }
     )
     .catch(() => {});
-  return ctx.reply("Coupon sent to the worker.");
+  return ctx.reply(emphasizeHtml("Log sent to the worker."), {
+    parse_mode: "HTML",
+  });
 };
 
 const requestCoupon = async (ctx, ticketId) => {
@@ -1581,7 +3339,7 @@ const requestCoupon = async (ctx, ticketId) => {
     return;
   }
   if (ticket.assignedAdminId !== ctx.chat.id) {
-    await ctx.answerCbQuery("Only the assigned worker can request coupons.");
+    await ctx.answerCbQuery("Only the assigned worker can request logs.");
     return;
   }
   if (!duffChatIds.length) {
@@ -1601,18 +3359,27 @@ const requestCoupon = async (ctx, ticketId) => {
   });
 
   const summary = formatTicketSummary(ticket);
-  let text = `🎟️ Coupon request for ticket #${ticketId}\nService: ${
-    ticket.service || ticket.category || "Order"
-  }`;
-  if (ticket.category) {
-    text += `\nCategory: ${ticket.category}`;
+  const header = emphasizeHtml(`Log request for ticket #${ticketId}`);
+  const serviceLine = emphasizeHtml(
+    `Service: ${escapeHtml(ticket.service || ticket.category || "Order")}`
+  );
+  const categoryLine = ticket.category
+    ? emphasizeHtml(`Category: ${escapeHtml(ticket.category)}`)
+    : null;
+  const workerLine = emphasizeHtml(`Worker: ${escapeHtml(alias)}`);
+  const summaryBlock = emphasizeHtml(escapeHtml(summary));
+  const instructions = `${emphasizeHtml(
+    "Reply to this message with the log details, or use"
+  )} <code>/log &lt;ticket_id&gt; &lt;log&gt;</code>.`;
+  let text = `${header}\n${serviceLine}`;
+  if (categoryLine) {
+    text += `\n${categoryLine}`;
   }
-  text += `\nWorker: ${alias}\n\n${summary}\n\n`;
-  text += "Reply to this message with the coupon details, or use /coupon <ticket_id> <code>.";
+  text += `\n${workerLine}\n\n${summaryBlock}\n\n${instructions}`;
 
   duffChatIds.forEach((chatId) => {
     ctx.telegram
-      .sendMessage(chatId, text)
+      .sendMessage(chatId, text, { parse_mode: "HTML" })
       .then((message) => {
         duffRequestMessages.set(
           duffMessageKey(chatId, message.message_id),
@@ -1622,8 +3389,10 @@ const requestCoupon = async (ctx, ticketId) => {
       .catch(() => {});
   });
 
-  await ctx.answerCbQuery("Coupon request sent to Duff.");
-  await ctx.reply("🎟️ Coupon request sent to Duff manager.");
+  await ctx.answerCbQuery("Log request sent to Duff.");
+  await ctx.reply(emphasizeHtml("Log request sent to Duff manager."), {
+    parse_mode: "HTML",
+  });
 };
 
 const handleAcceptAction = async (ctx) => {
@@ -1652,6 +3421,39 @@ const handleAcceptAction = async (ctx) => {
   } catch (_) {}
 };
 
+const handlePaidAction = async (ctx) => {
+  const ticketId = Number(ctx.match?.[1] || ctx.callbackQuery?.data?.split(":")[1]);
+  if (!isAdminChat(ctx)) {
+    await ctx.answerCbQuery("Not authorized.");
+    return;
+  }
+  if (!Number.isFinite(ticketId)) {
+    await ctx.answerCbQuery("Ticket not found.");
+    return;
+  }
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status !== "open") {
+    await ctx.answerCbQuery("Ticket not found or closed.");
+    return;
+  }
+  if (ticket.assignedAdminId && ticket.assignedAdminId !== ctx.chat.id) {
+    await ctx.answerCbQuery("Only the assigned worker can mark paid.");
+    return;
+  }
+  const alias = adminAlias(ctx);
+  ticket.paymentStatus = "paid";
+  ticket.paidAt = new Date().toISOString();
+  ticket.paidBy = alias;
+  tickets.set(ticketId, ticket);
+  updateTicketRecord(ticketId, {
+    paymentStatus: "paid",
+    paidAt: ticket.paidAt,
+    paidBy: alias,
+  });
+  await ctx.answerCbQuery("Marked paid.");
+  await ctx.reply(`Ticket #${ticketId} marked paid.`);
+};
+
 const handleCloseAction = async (ctx) => {
   const ticketId = Number(ctx.match?.[1] || ctx.callbackQuery?.data?.split(":")[1]);
   if (!isAdminChat(ctx)) {
@@ -1678,7 +3480,8 @@ const handleCloseAction = async (ctx) => {
   await refreshWorkerLists(ctx.telegram);
   return ctx.telegram.sendMessage(
     ticket.chatId,
-    `Ticket #${ticketId} has been closed by an admin.`
+    completionThankYou(ticketId),
+    { parse_mode: "HTML" }
   );
 };
 
@@ -1720,7 +3523,8 @@ bot.command("work", workPanel);
 bot.command("setname", setnameCommand);
 bot.command("accept", acceptCommand);
 bot.command("duff", duffPanel);
-bot.command("coupon", couponCommand);
+bot.command("log", logCommand);
+bot.command("coupon", logCommand);
 
 registerAdminReplyHandler(bot, "food");
 registerDuffReplyHandler(bot);
@@ -1729,20 +3533,34 @@ bot.on("text", adminPromptHandler);
 
 bot.action("menu:main", async (ctx) => {
   resetSession(ctx.chat.id);
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.IDLE,
+    temp: {},
+    nav: [SCREEN.HOME],
+  });
   await ctx.answerCbQuery();
-  return replyHtml(ctx, "🍔 <b>Food menu</b>", mainMenu());
+  return sendMainMenu(ctx);
 });
 
 bot.action("menu:food", async (ctx) => {
   resetSession(ctx.chat.id);
   await ctx.answerCbQuery();
-  return replyHtml(ctx, "🍔 <b>Choose a food category</b>", foodMenu(false));
+  return sendMainMenu(ctx);
+});
+
+bot.action("menu:quick", async (ctx) => {
+  await ctx.answerCbQuery();
+  return sendQuickActions(ctx);
 });
 
 bot.action("worker:panel", workerPanelAction);
 bot.action("worker:view", workerViewAction);
 bot.action("worker:close", workerCloseAction);
 bot.action("worker:alias", workerAliasAction);
+bot.action("profile:show", async (ctx) => {
+  await ctx.answerCbQuery();
+  return showProfile(ctx);
+});
 
 bot.action(/^service:(.+)/, async (ctx) => {
   const serviceKey = ctx.match[1];
@@ -1799,18 +3617,9 @@ bot.action(/^food:(.+)/, async (ctx) => {
     await ctx.answerCbQuery("Category not found.");
     return;
   }
-
-  setSession(ctx.chat.id, {
-    service: "food",
-    stage: "food_questions",
-    stepIndex: 0,
-    answers: {},
-    foodCategory: category.label,
-  });
-
   await ctx.answerCbQuery();
-  await replyHtml(ctx, FOOD_PROMO);
-  return replyHtml(ctx, FOOD_QUESTIONS[0].prompt);
+  await deleteSessionData(ctx.from.id);
+  return handleFoodOption(ctx, category.label);
 });
 
 bot.action("edit", async (ctx) => {
@@ -1872,11 +3681,165 @@ bot.action("confirm", async (ctx) => {
   resetSession(ctx.chat.id);
 });
 
-bot.on("text", (ctx) => {
-  if (isAdminChat(ctx)) {
+bot.on("text", async (ctx) => {
+  const isAdmin = isAdminChat(ctx);
+  const messageText = ctx.message.text.trim();
+  const lowerText = messageText.toLowerCase();
+  const flowSession = getSessionData(ctx.from.id);
+  const legacySession = sessions.get(ctx.chat.id);
+  const quickActionSet = new Set([
+    BTN_NEW_ORDER,
+    BTN_PROFILE,
+    BTN_ADDRESSES,
+    BTN_CHOOSE_ADDRESS,
+    BTN_LAST_ORDER,
+    BTN_SUPPORT,
+    BTN_CHANNEL,
+    BTN_MENU,
+    BTN_ADD_PROFILE_ADDR,
+    BTN_EDIT_PROFILE_ADDR,
+    BTN_BACK,
+    BTN_HOME,
+  ]);
+  const isQuickAction = quickActionSet.has(messageText) || lowerText === "menu";
+  if (
+    isAdmin &&
+    (!flowSession || flowSession.state === FLOW_STATES.IDLE) &&
+    !legacySession &&
+    !isQuickAction
+  ) {
     return;
   }
-  const session = sessions.get(ctx.chat.id);
+  if (messageText === BTN_MENU) {
+    resetSession(ctx.chat.id);
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.IDLE,
+      temp: {},
+      nav: [SCREEN.HOME],
+    });
+    return sendQuickActions(ctx);
+  }
+  if (lowerText === "menu") {
+    resetSession(ctx.chat.id);
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.IDLE,
+      temp: {},
+      nav: [SCREEN.HOME],
+    });
+    return sendQuickActions(ctx);
+  }
+  if (flowSession && flowSession.state && flowSession.state !== FLOW_STATES.IDLE) {
+    const handled = await handleProfileFlow(ctx, flowSession);
+    if (handled !== null) {
+      return handled;
+    }
+  }
+  if (messageText === BTN_HOME) {
+    return handleHome(ctx);
+  }
+  if (messageText === BTN_BACK) {
+    return handleBack(ctx);
+  }
+
+  if (messageText === BTN_NEW_ORDER) {
+    return sendMainMenu(ctx);
+  }
+  if (messageText === BTN_ADD_PROFILE_ADDR) {
+    const existing = getUser(ctx.from.id);
+    if (!existing) {
+      await saveSessionData(ctx.from.id, {
+        state: FLOW_STATES.AWAIT_NAME,
+        temp: { returnTo: "menu" },
+      });
+      return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+    }
+    const addresses = existing.addresses || [];
+    if (addresses.length >= 4) {
+      return ctx.reply(
+        "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+        Markup.keyboard([
+          [Markup.button.text(BTN_MANAGE_ADDR)],
+          [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+        ]).resize()
+      );
+    }
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_ADD_NAME,
+      temp: { returnTo: "profile" },
+    });
+    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+  }
+  if (messageText === BTN_EDIT_PROFILE_ADDR) {
+    const existing = getUser(ctx.from.id);
+    if (!existing) {
+      await ctx.reply("No profile saved yet.");
+      return sendQuickActions(ctx);
+    }
+    return showProfile(ctx);
+  }
+  if (messageText === BTN_PROFILE) {
+    return showProfile(ctx);
+  }
+  if (messageText === BTN_ADDRESSES || messageText === BTN_CHOOSE_ADDRESS) {
+    const user = getUser(ctx.from.id);
+    if (!user) {
+      return showProfile(ctx);
+    }
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      temp: { returnTo: "profile" },
+    });
+    return sendManageList(ctx, user);
+  }
+  if (messageText === BTN_ADD_ADDRESS) {
+    const user = getUser(ctx.from.id);
+    if (!user) {
+      return showProfile(ctx);
+    }
+    const addresses = user.addresses || [];
+    if (addresses.length >= 4) {
+      return ctx.reply(
+        "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
+        Markup.keyboard([
+          [Markup.button.text(BTN_MANAGE_ADDR)],
+          [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
+        ]).resize()
+      );
+    }
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_ADD_NAME,
+      temp: { returnTo: "profile" },
+    });
+    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+  }
+  if (messageText === BTN_MANAGE) {
+    const user = getUser(ctx.from.id);
+    if (!user) {
+      return showProfile(ctx);
+    }
+    await saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      temp: { returnTo: "profile" },
+    });
+    return sendManageList(ctx, user);
+  }
+  if (messageText === BTN_LAST_ORDER) {
+    return showLastOrder(ctx);
+  }
+  if (messageText === BTN_SUPPORT) {
+    return sendSupportPrompt(ctx);
+  }
+  if (messageText === BTN_CHANNEL) {
+    await ctx.reply(`📢 Channel: ${CHANNEL_URL}`);
+    return sendQuickActions(ctx);
+  }
+  if (messageText === BTN_DELETE_PROFILE) {
+    await deleteUser(ctx.from.id);
+    await deleteSessionData(ctx.from.id);
+    return ctx.reply("✅ Profile deleted.", Markup.removeKeyboard());
+  }
+
+  const session = legacySession;
   if (!session) {
     const openTicket = getOpenTicketByChat(ctx.chat.id);
     if (openTicket) {
@@ -1887,7 +3850,7 @@ bot.on("text", (ctx) => {
         openTicket.ticket
       );
     }
-    return replyHtml(ctx, START_PROMPT);
+    return sendQuickActions(ctx);
   }
 
   if (session.service === "food") {
@@ -1976,9 +3939,10 @@ bot.on("text", (ctx) => {
       ctx.reply(
         "🕘 You're being connected over to our workers! This could take a few moments..."
       );
-      return ctx.reply(
+      await ctx.reply(
         `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
       );
+      return sendQuickActions(ctx);
     }
 
     return replyHtml(ctx, START_PROMPT);
@@ -2169,7 +4133,7 @@ bot.on("text", (ctx) => {
       );
     }
 
-    return replyHtml(ctx, START_PROMPT);
+    return sendQuickActions(ctx);
   }
 
   if (session.stage === "confirm") {
@@ -2180,7 +4144,7 @@ bot.on("text", (ctx) => {
   }
 
   if (session.stage !== "collecting") {
-    return replyHtml(ctx, START_PROMPT);
+    return sendQuickActions(ctx);
   }
 
   const service = SERVICES[session.service];
@@ -2226,6 +4190,7 @@ bot.on("message", (ctx) => {
 });
 
 bot.action(/^accept:(\d+)/, handleAcceptAction);
+bot.action(/^paid:(\d+)/, handlePaidAction);
 bot.action(/^close:(\d+)/, handleCloseAction);
 bot.action(/^ban:(\d+)/, handleBanAction);
 bot.action(/^coupon:(\d+)/, async (ctx) => {
@@ -2275,7 +4240,8 @@ if (flightBotToken) {
   flightBot.command("setname", setnameCommand);
   flightBot.command("accept", acceptCommand);
   flightBot.command("duff", duffPanel);
-  flightBot.command("coupon", couponCommand);
+  flightBot.command("log", logCommand);
+  flightBot.command("coupon", logCommand);
 
   flightBot.action("flight:start", async (ctx) => {
     setFlightSession(ctx.chat.id, {
@@ -2295,6 +4261,7 @@ if (flightBotToken) {
   flightBot.action("worker:alias", workerAliasAction);
 
   flightBot.action(/^accept:(\d+)/, handleAcceptAction);
+  flightBot.action(/^paid:(\d+)/, handlePaidAction);
   flightBot.action(/^close:(\d+)/, handleCloseAction);
   flightBot.action(/^ban:(\d+)/, handleBanAction);
   flightBot.action(/^coupon:(\d+)/, async (ctx) => {
@@ -2480,7 +4447,8 @@ if (hotelBotToken) {
   hotelBot.command("setname", setnameCommand);
   hotelBot.command("accept", acceptCommand);
   hotelBot.command("duff", duffPanel);
-  hotelBot.command("coupon", couponCommand);
+  hotelBot.command("log", logCommand);
+  hotelBot.command("coupon", logCommand);
 
   hotelBot.action("hotel:start", async (ctx) => {
     setHotelSession(ctx.chat.id, {
@@ -2500,6 +4468,7 @@ if (hotelBotToken) {
   hotelBot.action("worker:alias", workerAliasAction);
 
   hotelBot.action(/^accept:(\d+)/, handleAcceptAction);
+  hotelBot.action(/^paid:(\d+)/, handlePaidAction);
   hotelBot.action(/^close:(\d+)/, handleCloseAction);
   hotelBot.action(/^ban:(\d+)/, handleBanAction);
   hotelBot.action(/^coupon:(\d+)/, async (ctx) => {
@@ -2657,28 +4626,97 @@ const withTimeout = (promise, ms, label) =>
     ),
   ]);
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const launchAttempts = new Map();
+
+const attachTextGuards = (botInstance, name) => {
+  const originalSendMessage = botInstance.telegram.sendMessage.bind(
+    botInstance.telegram
+  );
+  botInstance.telegram.sendMessage = (chatId, text, extra) =>
+    originalSendMessage(chatId, ensureText(text), extra);
+
+  botInstance.use((ctx, next) => {
+    if (ctx.reply) {
+      const originalReply = ctx.reply.bind(ctx);
+      ctx.reply = (text, extra) => {
+        const safeText = ensureText(text);
+        if (safeText !== text) {
+          console.warn(`[${name}] empty reply prevented chat:${ctx.chat?.id}`);
+        }
+        return originalReply(safeText, extra);
+      };
+    }
+    if (ctx.editMessageText) {
+      const originalEdit = ctx.editMessageText.bind(ctx);
+      ctx.editMessageText = (text, extra) =>
+        originalEdit(ensureText(text), extra);
+    }
+    return next();
+  });
+};
+
+const getMeWithRetry = async (botInstance, name) => {
+  const retries = Number.isFinite(startupGetMeRetries)
+    ? startupGetMeRetries
+    : 2;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      await withTimeout(
+        botInstance.telegram.getMe(),
+        startupTimeoutMs,
+        `${name} getMe`
+      );
+      return;
+    } catch (err) {
+      if (attempt >= retries) {
+        throw err;
+      }
+      await sleep(startupRetryBaseMs * (attempt + 1));
+    }
+  }
+};
+
 const launchBot = async (botInstance, name) => {
   try {
     try {
       await withTimeout(
         botInstance.telegram.deleteWebhook({ drop_pending_updates: true }),
-        15000,
+        startupTimeoutMs,
         `${name} deleteWebhook`
       );
     } catch (_) {}
-    await withTimeout(botInstance.telegram.getMe(), 15000, `${name} getMe`);
+    if (!startupSkipGetMe) {
+      try {
+        await getMeWithRetry(botInstance, name);
+      } catch (err) {
+        const message = err?.stack || err?.message || String(err);
+        console.warn(`[${name}] getMe failed, continuing: ${message}`);
+        if (startupRequireGetMe) {
+          throw err;
+        }
+      }
+    }
     await botInstance.launch({
       dropPendingUpdates: true,
       allowedUpdates: ["message", "callback_query"],
     });
     console.log(`[${name}] bot launched`);
+    launchAttempts.delete(name);
   } catch (err) {
     const message = err?.stack || err?.message || String(err);
     console.error(`[${name}] bot launch failed: ${message}`);
     try {
       botInstance.stop("restart");
     } catch (_) {}
-    setTimeout(() => launchBot(botInstance, name), 5000);
+    const attempt = (launchAttempts.get(name) || 0) + 1;
+    launchAttempts.set(name, attempt);
+    const backoff = Math.min(
+      startupRetryMaxMs,
+      startupRetryBaseMs * 2 ** Math.min(attempt, 6)
+    );
+    const jitter = Math.floor(Math.random() * startupRetryJitterMs);
+    setTimeout(() => launchBot(botInstance, name), backoff + jitter);
   }
 };
 
@@ -2690,9 +4728,10 @@ const registerErrorHandler = (botInstance, name) => {
   });
 };
 
-botEntries.forEach(({ bot: botInstance, name }) => {
+botEntries.forEach(({ bot: botInstance, name }, index) => {
+  attachTextGuards(botInstance, name);
   registerErrorHandler(botInstance, name);
-  launchBot(botInstance, name);
+  setTimeout(() => launchBot(botInstance, name), startupStaggerMs * index);
 });
 
 process.once("SIGINT", () =>

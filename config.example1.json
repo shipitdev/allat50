@@ -16,5 +16,13 @@
   "rateLimit": {
     "windowMinutes": 30,
     "maxTickets": 2
-  }
+  },
+  "startupTimeoutMs": 30000,
+  "startupRetryBaseMs": 5000,
+  "startupRetryMaxMs": 60000,
+  "startupRetryJitterMs": 750,
+  "startupGetMeRetries": 2,
+  "startupStaggerMs": 500,
+  "startupSkipGetMe": false,
+  "startupRequireGetMe": false
 }
