@@ -3700,6 +3700,7 @@ bot.on("text", async (ctx) => {
     BTN_EDIT_PROFILE_ADDR,
     BTN_BACK,
     BTN_HOME,
+    BTN_CANCEL_ORDER,
   ]);
   const isQuickAction = quickActionSet.has(messageText) || lowerText === "menu";
   if (
@@ -3733,6 +3734,16 @@ bot.on("text", async (ctx) => {
     if (handled !== null) {
       return handled;
     }
+  }
+  if (messageText === BTN_CANCEL_ORDER) {
+    if (flowSession) {
+      await deleteSessionData(ctx.from.id);
+    }
+    if (legacySession) {
+      resetSession(ctx.chat.id);
+    }
+    await ctx.reply("❌ Canceled.", Markup.removeKeyboard());
+    return;
   }
   if (messageText === BTN_HOME) {
     return handleHome(ctx);
