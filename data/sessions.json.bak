@@ -1,26 +1,16 @@
 {
   "1094145030": {
-    "state": "IDLE",
-    "temp": {},
+    "state": "AWAIT_ADDRESS_PICK",
+    "selectedOption": "🐼 Panda Express",
+    "temp": {
+      "mode": "picker"
+    },
     "nav": [
-      "HOME"
+      "HOME",
+      "ADDRESS_PICKER",
+      "SUBTOTAL",
+      "ADDRESS_PICKER"
     ],
-    "updatedAt": 1766749280396
-  },
-  "6334924480": {
-    "state": "IDLE",
-    "temp": {},
-    "nav": [
-      "HOME"
-    ],
-    "updatedAt": 1766749225823
-  },
-  "7815575780": {
-    "state": "IDLE",
-    "temp": {},
-    "nav": [
-      "HOME"
-    ],
-    "updatedAt": 1766749295667
+    "updatedAt": 1766766988272
   }
 }

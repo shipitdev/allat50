@@ -7,6 +7,7 @@ try {
   }
 } catch (_) {}
 const { Telegraf, Markup } = require("telegraf");
+const pTimeout = require("p-timeout");
 require("dotenv").config();
 
 const configPath = path.join(__dirname, "..", "config.json");
@@ -41,6 +42,8 @@ const usersStore = loadJsonFile(usersPath, {});
 const sessionsStore = loadJsonFile(sessionsPath, {});
 const SESSION_TTL_MS = 30 * 60 * 1000;
 let storageWriteQueue = Promise.resolve();
+let usersFlushTimer = null;
+let sessionsFlushTimer = null;
 const backupState = new Map();
 
 const maybeBackup = (filePath) => {
@@ -60,7 +63,7 @@ const maybeBackup = (filePath) => {
 };
 
 const atomicWriteJson = async (filePath, data) => {
-  const tmpPath = `${filePath}.tmp`;
+  const tmpPath = `${filePath}.tmp.${process.pid}`;
   maybeBackup(filePath);
   await fs.promises.writeFile(tmpPath, JSON.stringify(data, null, 2));
   await fs.promises.rename(tmpPath, filePath);
@@ -71,6 +74,32 @@ const queueWrite = async (filePath, data) => {
     .then(() => atomicWriteJson(filePath, data))
     .catch((err) => logError("storage write", err));
   return storageWriteQueue;
+};
+
+const scheduleFlushUsers = () => {
+  if (usersFlushTimer) {
+    return;
+  }
+  usersFlushTimer = setTimeout(() => {
+    usersFlushTimer = null;
+    queueWrite(usersPath, usersStore);
+  }, 300);
+  if (typeof usersFlushTimer.unref === "function") {
+    usersFlushTimer.unref();
+  }
+};
+
+const scheduleFlushSessions = () => {
+  if (sessionsFlushTimer) {
+    return;
+  }
+  sessionsFlushTimer = setTimeout(() => {
+    sessionsFlushTimer = null;
+    queueWrite(sessionsPath, sessionsStore);
+  }, 300);
+  if (typeof sessionsFlushTimer.unref === "function") {
+    sessionsFlushTimer.unref();
+  }
 };
 
 const cleanupSessions = () => {
@@ -91,22 +120,21 @@ const cleanupSessions = () => {
 setInterval(cleanupSessions, 5 * 60 * 1000).unref();
 
 const getUser = (userId) => usersStore[String(userId)] || null;
+const getAddresses = (user) =>
+  Array.isArray(user?.addresses) ? user.addresses : [];
 const saveUser = async (userId, user) => {
   const key = String(userId);
   const now = Date.now();
   user.createdAt = user.createdAt || now;
   user.updatedAt = now;
   usersStore[key] = user;
-  await queueWrite(usersPath, usersStore);
+  scheduleFlushUsers();
 };
 const deleteUser = async (userId) => {
   delete usersStore[String(userId)];
-  await queueWrite(usersPath, usersStore);
+  scheduleFlushUsers();
 };
-const getSessionData = (userId) => {
-  cleanupSessions();
-  return sessionsStore[String(userId)] || null;
-};
+const getSessionData = (userId) => sessionsStore[String(userId)] || null;
 const saveSessionData = async (userId, session) => {
   const key = String(userId);
   const existing = sessionsStore[key];
@@ -115,11 +143,11 @@ const saveSessionData = async (userId, session) => {
   }
   session.updatedAt = Date.now();
   sessionsStore[key] = session;
-  await queueWrite(sessionsPath, sessionsStore);
+  scheduleFlushSessions();
 };
 const deleteSessionData = async (userId) => {
   delete sessionsStore[String(userId)];
-  await queueWrite(sessionsPath, sessionsStore);
+  scheduleFlushSessions();
 };
 
 const ticketRecordsPath = (() => {
@@ -184,13 +212,24 @@ const bannedChatIds = new Set(
 );
 
 const ticketRecords = new Map();
+let ticketRecordsFlushTimer = null;
+
+const scheduleFlushTicketRecords = () => {
+  if (ticketRecordsFlushTimer) {
+    return;
+  }
+  ticketRecordsFlushTimer = setTimeout(() => {
+    ticketRecordsFlushTimer = null;
+    queueWrite(ticketRecordsPath, Object.fromEntries(ticketRecords.entries()));
+  }, 300);
+  if (typeof ticketRecordsFlushTimer.unref === "function") {
+    ticketRecordsFlushTimer.unref();
+  }
+};
 
 const saveTicketRecords = () => {
   try {
-    fs.writeFileSync(
-      ticketRecordsPath,
-      JSON.stringify(Object.fromEntries(ticketRecords.entries()), null, 2)
-    );
+    scheduleFlushTicketRecords();
     return true;
   } catch (err) {
     logError("ticket records save", err);
@@ -281,6 +320,13 @@ const logError = (label, err) => {
   console.error(`[${label}] ${message}`);
 };
 
+process.on("unhandledRejection", (err) =>
+  logError("unhandledRejection", err)
+);
+process.on("uncaughtException", (err) =>
+  logError("uncaughtException", err)
+);
+
 const ensureText = (value, fallback = "OK") => {
   if (typeof value !== "string") {
     return fallback;
@@ -289,6 +335,33 @@ const ensureText = (value, fallback = "OK") => {
     return fallback;
   }
   return value;
+};
+
+const withTimeout = (label, promise, ms = 12000) =>
+  pTimeout(promise, { milliseconds: ms }).catch((err) => {
+    logError(`timeout:${label}`, err);
+    return null;
+  });
+
+const safeReply = (ctx, text, extra) =>
+  withTimeout("ctx.reply", ctx.reply(ensureText(text), extra));
+
+const safeReplyHtml = (ctx, html, extra) =>
+  withTimeout("ctx.replyWithHTML", ctx.replyWithHTML(ensureText(html), extra));
+
+const safeReplyPhoto = (ctx, photo, extra) =>
+  withTimeout("ctx.replyWithPhoto", ctx.replyWithPhoto(photo, extra));
+
+const step = async (label, fn) => {
+  const startedAt = Date.now();
+  try {
+    return await fn();
+  } finally {
+    const ms = Date.now() - startedAt;
+    if (ms > 800) {
+      console.warn(`[slow-step] ${label} ${ms}ms`);
+    }
+  }
 };
 
 const normalizeUsername = (value) =>
@@ -333,7 +406,47 @@ const quickLinksSection = () => {
   }`;
 };
 
+const attachBotMiddlewares = (botInstance, label) => {
+  botInstance.use(async (ctx, next) => {
+    if (ctx.callbackQuery) {
+      ctx.answerCbQuery().catch(() => {});
+    }
+    return next();
+  });
+  botInstance.use(async (ctx, next) => {
+    const startedAt = Date.now();
+    try {
+      return await next();
+    } finally {
+      const ms = Date.now() - startedAt;
+      if (ms > 800) {
+        console.warn(`[slow] ${ms}ms ${label}:${ctx.updateType}`);
+      }
+    }
+  });
+  botInstance.use(async (ctx, next) => {
+    const warnAfterMs = 15000;
+    const timer = setTimeout(() => {
+      const userId = ctx.from?.id;
+      const chatId = ctx.chat?.id;
+      console.warn(
+        `[watchdog] ${label} still running after ${warnAfterMs}ms update=${ctx.updateType} chat=${chatId} user=${userId}`
+      );
+    }, warnAfterMs);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    try {
+      return await next();
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  botInstance.catch((err) => logError(`${label} telegraf`, err));
+};
+
 const bot = new Telegraf(token);
+attachBotMiddlewares(bot, "food");
 const sessions = new Map();
 const tickets = new Map();
 const adminTicketMessages = new Map();
@@ -342,9 +455,55 @@ const customerTickets = new Map();
 const ticketHistory = new Map();
 const adminPrompts = new Map();
 const workerListMessages = new Map();
+const MAX_OPEN_TICKETS_PER_CHAT = 4;
 let ticketCounter = Number.isFinite(Number(config.ticketCounter))
   ? Number(config.ticketCounter)
   : 60;
+
+const rebuildOpenTickets = () => {
+  for (const [ticketId, record] of ticketRecords.entries()) {
+    if (!record || record.status !== "open") {
+      continue;
+    }
+    const chatId = Number(record.chatId);
+    if (!Number.isFinite(chatId)) {
+      continue;
+    }
+    const ticket = {
+      chatId,
+      status: "open",
+      service: record.service || record.category || "Order",
+      category: record.category,
+      botKey: record.botKey,
+      answers: record.answers || {},
+      adminMessages: [],
+    };
+    if (record.assignedAdminId) {
+      ticket.assignedAdminId = record.assignedAdminId;
+    }
+    if (record.assignedAlias) {
+      ticket.assignedAlias = record.assignedAlias;
+    }
+    if (record.couponRequested) {
+      ticket.couponRequested = record.couponRequested;
+      ticket.couponRequestedBy = record.couponRequestedBy;
+      ticket.couponRequestedAt = record.couponRequestedAt;
+    }
+    if (record.couponProvidedBy) {
+      ticket.couponProvidedBy = record.couponProvidedBy;
+      ticket.couponProvidedAt = record.couponProvidedAt;
+    }
+    if (record.paymentStatus) {
+      ticket.paymentStatus = record.paymentStatus;
+      ticket.paidAt = record.paidAt;
+      ticket.paidBy = record.paidBy;
+    }
+    tickets.set(ticketId, ticket);
+    addOpenTicketForChat(chatId, ticketId);
+  }
+};
+
+rebuildOpenTickets();
 
 const SERVICES = {};
 
@@ -610,6 +769,8 @@ const FLOW_STATES = {
   AWAIT_CONFIRM: "AWAIT_CONFIRM",
   AWAIT_SUPPORT: "AWAIT_SUPPORT",
   AWAIT_LAST_ORDER: "AWAIT_LAST_ORDER",
+  AWAIT_NEW_TICKET_CONFIRM: "AWAIT_NEW_TICKET_CONFIRM",
+  AWAIT_TICKET_PICK: "AWAIT_TICKET_PICK",
 };
 
 const BTN_ADD_ADDRESS = "➕ Add Address";
@@ -645,6 +806,10 @@ const BTN_ADDRESSES = "📍 Addresses";
 const BTN_MENU = "☰ Menu";
 const BTN_ADD_PROFILE_ADDR = "➕ Add Profile/Address";
 const BTN_EDIT_PROFILE_ADDR = "✏️ Edit/Delete Profile/Address";
+const BTN_MY_TICKETS = "🎟 My Tickets";
+const BTN_OPEN_ANOTHER = "✅ Open another";
+const BTN_OPEN_THIS = "✅ Open this request";
+const BTN_CANCEL_GENERIC = "❌ Cancel";
 
 const SCREEN = {
   HOME: "HOME",
@@ -658,6 +823,7 @@ const SCREEN = {
   CONFIRM: "CONFIRM",
   LAST_ORDER: "LAST_ORDER",
   SUPPORT: "SUPPORT",
+  TICKETS: "TICKETS",
 };
 
 const NAV_MAX = 10;
@@ -692,9 +858,27 @@ const recordScreen = async (ctx, screenId) => {
   if (!userId) {
     return;
   }
-  const session = getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} };
+  const existing = getSessionData(userId);
+  const session =
+    existing && typeof existing === "object"
+      ? existing
+      : { state: FLOW_STATES.IDLE, temp: {} };
   const nav = updateNavStack(session.nav, screenId);
   await saveSessionData(userId, { ...session, nav });
+};
+
+const ensureFlowState = async (userId, nextState) => {
+  if (!userId || !nextState) {
+    return;
+  }
+  const existing = getSessionData(userId);
+  const session =
+    existing && typeof existing === "object"
+      ? existing
+      : { state: FLOW_STATES.IDLE, temp: {} };
+  if (session.state !== nextState) {
+    await saveSessionData(userId, { ...session, state: nextState });
+  }
 };
 
 const LABEL_HOME = "🏠 Home";
@@ -779,11 +963,15 @@ const addressPickerKeyboard = (user) => {
     );
   }
   if (others.length) {
-    rows.push(
-      others.slice(0, 2).map((addr) => Markup.button.text(`📍 ${addr.label}`))
-    );
+    for (let i = 0; i < others.length; i += 2) {
+      rows.push(
+        others
+          .slice(i, i + 2)
+          .map((addr) => Markup.button.text(`📍 ${addr.label}`))
+      );
+    }
   }
-  rows.push([Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE)]);
+  rows.push([Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE_ADDR)]);
   rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
   return Markup.keyboard(rows).resize();
 };
@@ -792,7 +980,7 @@ const singleAddressKeyboard = () =>
   Markup.keyboard([
     [Markup.button.text(BTN_USE_DEFAULT)],
     [Markup.button.text(BTN_CHOOSE_ANOTHER), Markup.button.text(BTN_ADD_ADDRESS)],
-    [Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_MANAGE_ADDR)],
     [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
   ]).resize();
 
@@ -822,7 +1010,7 @@ const addressLabelKeyboard = () =>
 
 const subtotalKeyboard = () =>
   Markup.keyboard([
-    [Markup.button.text(BTN_CHANGE_ADDRESS), Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_CHANGE_ADDRESS), Markup.button.text(BTN_MANAGE_ADDR)],
     [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
   ]).resize();
 
@@ -837,6 +1025,7 @@ const confirmOrderKeyboard = () =>
 
 const quickActionsKeyboard = () =>
   Markup.keyboard([
+    [Markup.button.text(BTN_MY_TICKETS)],
     [Markup.button.text(BTN_ADD_PROFILE_ADDR)],
     [Markup.button.text(BTN_EDIT_PROFILE_ADDR)],
     [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
@@ -850,6 +1039,32 @@ const lastOrderKeyboard = () =>
     [Markup.button.text(BTN_CANCEL_ORDER)],
     [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
   ]).resize();
+
+const openAnotherKeyboardGeneric = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_OPEN_ANOTHER)],
+    [Markup.button.text(BTN_MY_TICKETS), Markup.button.text(BTN_SUPPORT)],
+    [Markup.button.text(BTN_CANCEL_GENERIC), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const openAnotherKeyboardService = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_OPEN_THIS)],
+    [Markup.button.text(BTN_MY_TICKETS)],
+    [Markup.button.text(BTN_CANCEL_GENERIC), Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const maxLimitKeyboard = () =>
+  Markup.keyboard([
+    [Markup.button.text(BTN_MY_TICKETS), Markup.button.text(BTN_SUPPORT)],
+    [Markup.button.text(BTN_HOME)],
+  ]).resize();
+
+const ticketsKeyboard = (ids = []) => {
+  const rows = ids.map((id) => [Markup.button.text(`🎟 Ticket #${id}`)]);
+  rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
+  return Markup.keyboard(rows).resize();
+};
 
 const manageListKeyboard = (user) => {
   const { home, work, others } = addressSlots(user);
@@ -866,9 +1081,13 @@ const manageListKeyboard = (user) => {
     );
   }
   if (others.length) {
-    rows.push(
-      others.slice(0, 2).map((addr) => Markup.button.text(`📍 ${addr.label}`))
-    );
+    for (let i = 0; i < others.length; i += 2) {
+      rows.push(
+        others
+          .slice(i, i + 2)
+          .map((addr) => Markup.button.text(`📍 ${addr.label}`))
+      );
+    }
   }
   rows.push([Markup.button.text(BTN_ADD_ADDRESS)]);
   rows.push([Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]);
@@ -894,7 +1113,7 @@ const deleteConfirmKeyboard = () =>
 const profileKeyboard = () =>
   Markup.keyboard([
     [Markup.button.text(BTN_CHOOSE_ADDRESS)],
-    [Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE)],
+    [Markup.button.text(BTN_ADD_ADDRESS), Markup.button.text(BTN_MANAGE_ADDR)],
     [Markup.button.text(BTN_DELETE_PROFILE)],
     [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
   ]).resize();
@@ -903,10 +1122,11 @@ const backHomeKeyboard = () =>
   Markup.keyboard([[Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)]]).resize();
 
 const createAddressId = (user) => {
+  const existing = getAddresses(user);
   const base = `addr${Date.now()}`;
   const suffix = Math.floor(Math.random() * 1000);
   const id = `${base}${suffix}`;
-  if (!user.addresses?.some((addr) => addr.id === id)) {
+  if (!existing.some((addr) => addr && addr.id === id)) {
     return id;
   }
   return `${base}${suffix}${Math.floor(Math.random() * 10)}`;
@@ -924,11 +1144,22 @@ const resolveLabelChoice = (choice, user) => {
     return "Work";
   }
   if (label === LABEL_OTHER) {
-    const addresses = user.addresses || [];
-    const others = addresses.filter(
-      (addr) => !isHomeLabel(addr.label) && !isWorkLabel(addr.label)
+    const addresses = getAddresses(user);
+    const existing = new Set(
+      addresses
+        .map((addr) => normalizeLabel(addr.label).toLowerCase())
+        .filter(Boolean)
     );
-    return others.length ? "Other 2" : "Other";
+    if (!existing.has("other")) {
+      return "Other";
+    }
+    for (let i = 2; i <= 99; i += 1) {
+      const candidate = `other ${i}`;
+      if (!existing.has(candidate)) {
+        return `Other ${i}`;
+      }
+    }
+    return "Other";
   }
   return null;
 };
@@ -957,6 +1188,9 @@ const startLegacyFoodFlow = (ctx, optionLabel) => {
 };
 
 const sendMainMenu = async (ctx) => {
+  if (openTicketCountForChat(ctx.chat.id) > 0) {
+    return promptOpenAnother(ctx, { type: "menu" });
+  }
   const userId = ctx.from?.id;
   if (userId) {
     const session = getSessionData(userId);
@@ -968,21 +1202,34 @@ const sendMainMenu = async (ctx) => {
       });
     }
   }
-  await recordScreen(ctx, SCREEN.HOME);
-  return replyHtml(ctx, "🍔 <b>Choose a food category</b>", mainMenu());
+  await step("recordScreen:home", () => recordScreen(ctx, SCREEN.HOME));
+  await step("reply:mainMenuTitle", () =>
+    safeReply(ctx, "🏠 Main Menu", Markup.removeKeyboard())
+  );
+  return step("reply:mainMenu", () =>
+    replyHtml(ctx, "🍔 <b>Pick a category to start</b>", mainMenu())
+  );
 };
 
 const sendAddressPicker = async (ctx, optionLabel, user) => {
   const message =
-    `✅ ${optionLabel}\n\n` +
-    "📍 Choose an address:";
-  await saveSessionData(ctx.from.id, {
-    state: FLOW_STATES.AWAIT_ADDRESS_PICK,
-    selectedOption: optionLabel,
-    temp: { mode: "picker" },
-  });
-  await recordScreen(ctx, SCREEN.ADDRESS_PICKER);
-  return ctx.reply(message, addressPickerKeyboard(user));
+    `📍 Address for: ${optionLabel}\n` +
+    "Choose where we're delivering.";
+  const prev = getSessionData(ctx.from.id) || {};
+  await step("saveSession:addressPicker", () =>
+    saveSessionData(ctx.from.id, {
+      ...prev,
+      state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+      selectedOption: optionLabel,
+      temp: { ...(prev.temp || {}), mode: "picker" },
+    })
+  );
+  await step("recordScreen:addressPicker", () =>
+    recordScreen(ctx, SCREEN.ADDRESS_PICKER)
+  );
+  return step("reply:addressPicker", () =>
+    safeReply(ctx, message, addressPickerKeyboard(user))
+  );
 };
 
 const sendSingleAddressPrompt = async (ctx, optionLabel, user, address) => {
@@ -990,56 +1237,78 @@ const sendSingleAddressPrompt = async (ctx, optionLabel, user, address) => {
   const contactName = address.name || user.name || "-";
   const contactPhone = address.phone || user.phone || "-";
   const message =
-    `✅ ${optionLabel}\n\n` +
-    `👤 ${contactName}\n` +
-    `📞 ${contactPhone}\n` +
+    "📍 Confirm delivery details\n" +
+    `${optionLabel}\n\n` +
+    `👤 ${contactName} · 📞 ${contactPhone}\n` +
     `📍 ${address.label}: ${shortAddr}\n\n` +
-    "Ready when you are 👇";
-  await saveSessionData(ctx.from.id, {
-    state: FLOW_STATES.AWAIT_ADDRESS_PICK,
-    selectedOption: optionLabel,
-    temp: { mode: "single", addressId: address.id },
-  });
-  await recordScreen(ctx, SCREEN.ADDRESS_PICKER);
-  return ctx.reply(message, singleAddressKeyboard());
+    "Tap ✅ Use this address to continue.";
+  const prev = getSessionData(ctx.from.id) || {};
+  await step("saveSession:singleAddress", () =>
+    saveSessionData(ctx.from.id, {
+      ...prev,
+      state: FLOW_STATES.AWAIT_ADDRESS_PICK,
+      selectedOption: optionLabel,
+      temp: { ...(prev.temp || {}), mode: "single", addressId: address.id },
+    })
+  );
+  await step("recordScreen:singleAddress", () =>
+    recordScreen(ctx, SCREEN.ADDRESS_PICKER)
+  );
+  return step("reply:singleAddress", () =>
+    safeReply(ctx, message, singleAddressKeyboard())
+  );
 };
 
 const sendProfilePrompt = async (ctx, optionLabel) => {
   const message =
-    `✅ ${optionLabel}\n\n` +
-    "Want 1-tap orders next time?\n" +
-    "Save your profile once (name + phone + up to 4 addresses).";
-  await saveSessionData(ctx.from.id, {
-    state: FLOW_STATES.AWAIT_PROFILE_CHOICE,
-    selectedOption: optionLabel,
-    temp: {},
-  });
-  await recordScreen(ctx, SCREEN.PROFILE_CREATE);
-  return ctx.reply(message, profilePromptKeyboard());
+    "⚡ Faster checkout next time\n" +
+    "Save your details once (name + phone + up to 4 addresses).\n\n" +
+    "Want to set it up now?";
+  await step("saveSession:profilePrompt", () =>
+    saveSessionData(ctx.from.id, {
+      state: FLOW_STATES.AWAIT_PROFILE_CHOICE,
+      selectedOption: optionLabel,
+      temp: {},
+    })
+  );
+  await step("recordScreen:profilePrompt", () =>
+    recordScreen(ctx, SCREEN.PROFILE_CREATE)
+  );
+  return step("reply:profilePrompt", () =>
+    safeReply(ctx, message, profilePromptKeyboard())
+  );
 };
 
 const sendSubtotalPrompt = async (ctx, label, addressText, suggestedSubtotal) => {
   const shortAddr = shortText(addressText, 50);
   const message =
-    `✅ Using ${label}: ${shortAddr}\n\n` +
-    "✍️ Send subtotal (before tax/fees):\n" +
+    "💰 Subtotal (before tax/fees)\n" +
+    `📍 ${label}: ${shortAddr}\n` +
     (Number.isFinite(suggestedSubtotal)
-      ? `(last: $${Number(suggestedSubtotal).toFixed(2)})\n`
+      ? `Last time: $${Number(suggestedSubtotal).toFixed(2)}\n`
       : "") +
-    "(just type a number like 55 or $55)";
-  await recordScreen(ctx, SCREEN.SUBTOTAL);
-  return ctx.reply(message, subtotalKeyboard());
+    "\nSend a number (example: 55)";
+  await step("recordScreen:subtotal", () =>
+    recordScreen(ctx, SCREEN.SUBTOTAL)
+  );
+  return step("reply:subtotal", () =>
+    safeReply(ctx, message, subtotalKeyboard())
+  );
 };
 
 const sendConfirmCard = async (ctx, optionLabel, addressLabel, subtotal) => {
   const message =
-    "🧾 Confirm order\n\n" +
-    `${optionLabel}\n` +
+    "🧾 Review request\n" +
+    `${optionLabel}\n\n` +
     `📍 ${addressLabel}\n` +
     `💰 Subtotal: $${subtotal.toFixed(2)}\n\n` +
-    "👇 Confirm to submit";
-  await recordScreen(ctx, SCREEN.CONFIRM);
-  return ctx.reply(message, confirmOrderKeyboard());
+    "Tap ✅ Submit Order to open the request.";
+  await step("recordScreen:confirm", () =>
+    recordScreen(ctx, SCREEN.CONFIRM)
+  );
+  return step("reply:confirm", () =>
+    safeReply(ctx, message, confirmOrderKeyboard())
+  );
 };
 
 const sendQuickActions = async (ctx) => {
@@ -1055,7 +1324,55 @@ const sendQuickActions = async (ctx) => {
     }
   }
   await recordScreen(ctx, SCREEN.QUICK_ACTIONS);
-  return ctx.reply("Menu", quickActionsKeyboard());
+  return safeReply(ctx, "Menu", quickActionsKeyboard());
+};
+
+const promptOpenAnother = async (ctx, pending) => {
+  const openCount = openTicketCountForChat(ctx.chat.id);
+  if (openCount >= MAX_OPEN_TICKETS_PER_CHAT) {
+    return safeReply(ctx, 
+      "⚠️ You’ve reached the 4 active request limit.\nPlease close one to open a new request.",
+      maxLimitKeyboard()
+    );
+  }
+
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_NEW_TICKET_CONFIRM,
+    temp: { pending: pending || { type: "menu" } },
+  });
+
+  if (pending?.type === "food" || pending?.type === "flight" || pending?.type === "hotel") {
+    return safeReply(ctx, 
+      `🎟 You already have ${openCount} active request(s).\nOpen a new request for ${pending.label}?`,
+      openAnotherKeyboardService()
+    );
+  }
+
+  return safeReply(ctx, 
+    `🎟 You already have ${openCount} active request(s).\nWhat would you like to do?`,
+    openAnotherKeyboardGeneric()
+  );
+};
+
+const sendMyTickets = async (ctx) => {
+  const ids = getOpenTicketIdsForChat(ctx.chat.id);
+  if (!ids.length) {
+    await safeReply(ctx, "No active tickets right now.");
+    return sendMainMenu(ctx);
+  }
+
+  await saveSessionData(ctx.from.id, {
+    state: FLOW_STATES.AWAIT_TICKET_PICK,
+    temp: {},
+  });
+
+  await recordScreen(ctx, SCREEN.TICKETS);
+
+  return safeReply(
+    ctx,
+    `🎟 Your active requests (${ids.length}/${MAX_OPEN_TICKETS_PER_CHAT})\nTap a ticket to view:`,
+    ticketsKeyboard(ids)
+  );
 };
 
 const sendSupportPrompt = async (ctx) => {
@@ -1064,25 +1381,27 @@ const sendSupportPrompt = async (ctx) => {
     temp: {},
   });
   await recordScreen(ctx, SCREEN.SUPPORT);
-  return ctx.reply("🆘 Support\nDescribe your issue in one message.\nA human will reply.");
+  return safeReply(
+    ctx,
+    "🆘 Support\nDescribe your issue in one message.\nA human will reply."
+  );
 };
 
 const showLastOrder = async (ctx) => {
   const user = getUser(ctx.from.id);
   const lastOrder = user?.lastOrder;
   if (!lastOrder) {
-    await ctx.reply("No recent orders yet.");
+    await safeReply(ctx, "No recent orders yet.");
     return sendQuickActions(ctx);
   }
+  const addresses = getAddresses(user);
   let address = null;
   if (lastOrder.addressId) {
-    address = (user.addresses || []).find(
-      (addr) => addr.id === lastOrder.addressId
-    );
+    address = addresses.find((addr) => addr.id === lastOrder.addressId);
   }
   const label = address?.label || lastOrder.addressLabel || "Address";
   const addressText = address?.text || lastOrder.addressText || "";
-  if (!addressText && (user?.addresses || []).length) {
+  if (!addressText && addresses.length) {
     await saveSessionData(ctx.from.id, {
       state: FLOW_STATES.AWAIT_ADDRESS_PICK,
       selectedOption: lastOrder.option,
@@ -1119,13 +1438,28 @@ const showLastOrder = async (ctx) => {
     },
   });
   await recordScreen(ctx, SCREEN.LAST_ORDER);
-  return ctx.reply(message, lastOrderKeyboard());
+  return safeReply(ctx, message, lastOrderKeyboard());
 };
 
 const sendManageList = async (ctx, user) => {
+  const userId = ctx.from?.id;
+  if (userId) {
+    const existing = getSessionData(userId);
+    const session =
+      existing && typeof existing === "object"
+        ? existing
+        : { state: FLOW_STATES.IDLE, temp: {} };
+    if (session.state !== FLOW_STATES.AWAIT_MANAGE_PICK) {
+      await saveSessionData(userId, { ...session, state: FLOW_STATES.AWAIT_MANAGE_PICK });
+    }
+  }
   const message = "⚙️ Manage your saved addresses\n(select one)";
-  await recordScreen(ctx, SCREEN.MANAGE_ADDRESSES);
-  return ctx.reply(message, manageListKeyboard(user));
+  await step("recordScreen:manageList", () =>
+    recordScreen(ctx, SCREEN.MANAGE_ADDRESSES)
+  );
+  return step("reply:manageList", () =>
+    safeReply(ctx, message, manageListKeyboard(user))
+  );
 };
 
 const sendManageAddressCard = async (ctx, address) => {
@@ -1136,28 +1470,65 @@ const sendManageAddressCard = async (ctx, address) => {
     `${address.text}\n\n` +
     `👤 ${contactName}\n` +
     `📞 ${contactPhone}`;
-  await recordScreen(ctx, SCREEN.MANAGE_ADDRESS);
-  return ctx.reply(message, manageActionsKeyboard());
+  await step("recordScreen:manageCard", () =>
+    recordScreen(ctx, SCREEN.MANAGE_ADDRESS)
+  );
+  return step("reply:manageCard", () =>
+    safeReply(ctx, message, manageActionsKeyboard())
+  );
 };
 
-const handleFoodOption = async (ctx, optionLabel) => {
-  const user = getUser(ctx.from.id);
+const handleFoodOption = async (ctx, optionLabel, options = {}) => {
+  const userId = ctx.from?.id;
+  if (!userId) {
+    return;
+  }
+  if (!options.bypassTicketPrompt && openTicketCountForChat(ctx.chat.id) > 0) {
+    return promptOpenAnother(ctx, { type: "food", label: optionLabel, optionLabel });
+  }
+  const activeSession = getSessionData(userId);
+  if (activeSession && activeSession.state && activeSession.state !== FLOW_STATES.IDLE) {
+    await deleteSessionData(userId);
+  }
+  const user = getUser(userId);
   if (!user) {
     return sendProfilePrompt(ctx, optionLabel);
   }
-  const addresses = Array.isArray(user.addresses) ? user.addresses : [];
+  const addresses = getAddresses(user);
   if (addresses.length === 0) {
     await saveSessionData(ctx.from.id, {
       state: FLOW_STATES.AWAIT_ADD_NAME,
       selectedOption: optionLabel,
       temp: { returnTo: "picker" },
     });
-    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+    return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
   }
   if (addresses.length === 1) {
     return sendSingleAddressPrompt(ctx, optionLabel, user, addresses[0]);
   }
   return sendAddressPicker(ctx, optionLabel, user);
+};
+
+const startFlightFlow = async (ctx, setSessionFn) => {
+  setSessionFn(ctx.chat.id, {
+    service: "flight",
+    stage: "flight_questions",
+    stepIndex: 0,
+    answers: {},
+  });
+  await replyHtml(ctx, FLIGHT_PROMO);
+  return replyHtml(ctx, FLIGHT_QUESTIONS[0].prompt);
+};
+
+const startHotelFlow = async (ctx, setSessionFn) => {
+  setSessionFn(ctx.chat.id, {
+    service: "hotel",
+    stage: "hotel_questions",
+    stepIndex: 0,
+    answers: {},
+  });
+  await replyHtml(ctx, HOTEL_PROMO);
+  return replyHtml(ctx, HOTEL_QUESTIONS[0].prompt);
 };
 
 const parseSubtotal = (text) => {
@@ -1175,12 +1546,14 @@ const parseSubtotal = (text) => {
 const showProfile = async (ctx) => {
   const user = getUser(ctx.from.id);
   if (!user) {
-    return ctx.reply(
+    return safeReply(
+      ctx,
       "No profile saved yet.\nTap a food option and choose Create Profile."
     );
   }
-  const addressCount = Array.isArray(user.addresses) ? user.addresses.length : 0;
-  const defaultAddress = (user.addresses || []).find(
+  const addresses = getAddresses(user);
+  const addressCount = addresses.length;
+  const defaultAddress = addresses.find(
     (addr) => addr.id === user.defaultAddressId
   );
   const contactName = defaultAddress?.name || user.name || "-";
@@ -1190,10 +1563,20 @@ const showProfile = async (ctx) => {
     `📞 ${contactPhone}\n` +
     `📍 Saved addresses: ${addressCount}/4`;
   await recordScreen(ctx, SCREEN.PROFILE_MENU);
-  return ctx.reply(message, profileKeyboard());
+  return safeReply(ctx, message, profileKeyboard());
 };
 
 const finalizeOrder = async (ctx, optionLabel, user, address, subtotal) => {
+  if (!canOpenAnotherTicket(ctx.chat.id)) {
+    await safeReply(ctx, 
+      "⚠️ You’ve reached the 4 active request limit.\nPlease close one to open a new request.",
+      Markup.keyboard([
+        [Markup.button.text(BTN_MY_TICKETS), Markup.button.text(BTN_SUPPORT)],
+        [Markup.button.text(BTN_HOME)],
+      ]).resize()
+    );
+    return null;
+  }
   const contactName = address.name || user.name || "-";
   const contactPhone = address.phone || user.phone || "-";
   const ticketId = nextTicketId();
@@ -1217,8 +1600,15 @@ const finalizeOrder = async (ctx, optionLabel, user, address, subtotal) => {
     category: optionLabel,
     chatId: ctx.chat.id,
     botKey: "food",
+    answers: {
+      name: contactName,
+      phone: contactPhone,
+      address: address.text,
+      addressLabel: address.label,
+      subtotal: subtotal,
+    },
   });
-  customerTickets.set(ctx.chat.id, ticketId);
+  addOpenTicketForChat(ctx.chat.id, ticketId);
 
   const summary = [
     `Option: ${optionLabel}`,
@@ -1233,9 +1623,15 @@ const finalizeOrder = async (ctx, optionLabel, user, address, subtotal) => {
     "Reply to this message to chat with the customer.";
 
   adminChatIds.forEach((chatId) => {
-    bot.telegram
-      .sendMessage(chatId, adminMessage, adminTicketKeyboard(ticketId))
+    withTimeout(
+      "admin.sendMessage",
+      bot.telegram.sendMessage(chatId, adminMessage, adminTicketKeyboard(ticketId)),
+      12000
+    )
       .then((message) => {
+        if (!message) {
+          return;
+        }
         adminTicketMessages.set(
           adminMessageKey(chatId, message.message_id),
           { ticketId, botKey: "food" }
@@ -1252,9 +1648,8 @@ const finalizeOrder = async (ctx, optionLabel, user, address, subtotal) => {
       .catch((err) => logError(`food admin notify #${ticketId}`, err));
   });
 
-  refreshWorkerLists(ctx.telegram).catch((err) =>
-    logError("food refresh worker list", err)
-  );
+  withTimeout("refreshWorkerLists", refreshWorkerLists(ctx.telegram), 12000)
+    .catch((err) => logError("food refresh worker list", err));
 
   if (user) {
     const updatedUser = {
@@ -1277,10 +1672,9 @@ const resolveSessionAddress = (user, session) => {
   if (!user || !session) {
     return null;
   }
+  const addresses = getAddresses(user);
   if (session.selectedAddressId) {
-    const match = (user.addresses || []).find(
-      (addr) => addr.id === session.selectedAddressId
-    );
+    const match = addresses.find((addr) => addr.id === session.selectedAddressId);
     if (match) {
       return match;
     }
@@ -1297,7 +1691,9 @@ const resolveSessionAddress = (user, session) => {
 
 const renderScreen = async (ctx, screenId) => {
   const userId = ctx.from?.id;
-  const session = userId ? getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} } : null;
+  const session = userId
+    ? getSessionData(userId) || { state: FLOW_STATES.IDLE, temp: {} }
+    : null;
   const user = userId ? getUser(userId) : null;
 
   if (!session || !userId) {
@@ -1310,6 +1706,7 @@ const renderScreen = async (ctx, screenId) => {
     case SCREEN.QUICK_ACTIONS:
       return sendQuickActions(ctx);
     case SCREEN.PROFILE_MENU:
+      await ensureFlowState(userId, FLOW_STATES.IDLE);
       return showProfile(ctx);
     case SCREEN.PROFILE_CREATE:
       if (session.selectedOption) {
@@ -1317,13 +1714,15 @@ const renderScreen = async (ctx, screenId) => {
       }
       return sendMainMenu(ctx);
     case SCREEN.ADDRESS_PICKER: {
+      await ensureFlowState(userId, FLOW_STATES.AWAIT_ADDRESS_PICK);
       if (!user || !session.selectedOption) {
         return sendMainMenu(ctx);
       }
+      const addresses = getAddresses(user);
       if (session.temp?.mode === "single") {
         const addressId =
           session.temp?.addressId || session.selectedAddressId || user.defaultAddressId;
-        const address = (user.addresses || []).find((addr) => addr.id === addressId);
+        const address = addresses.find((addr) => addr.id === addressId);
         if (address) {
           return sendSingleAddressPrompt(ctx, session.selectedOption, user, address);
         }
@@ -1331,6 +1730,7 @@ const renderScreen = async (ctx, screenId) => {
       return sendAddressPicker(ctx, session.selectedOption, user);
     }
     case SCREEN.SUBTOTAL: {
+      await ensureFlowState(userId, FLOW_STATES.AWAIT_SUBTOTAL);
       const address = resolveSessionAddress(user, session);
       if (!address) {
         return sendMainMenu(ctx);
@@ -1346,6 +1746,7 @@ const renderScreen = async (ctx, screenId) => {
       );
     }
     case SCREEN.CONFIRM: {
+      await ensureFlowState(userId, FLOW_STATES.AWAIT_CONFIRM);
       const address = resolveSessionAddress(user, session);
       if (!address) {
         return sendMainMenu(ctx);
@@ -1366,37 +1767,39 @@ const renderScreen = async (ctx, screenId) => {
     }
     case SCREEN.MANAGE_ADDRESSES:
       if (user) {
+        await ensureFlowState(userId, FLOW_STATES.AWAIT_MANAGE_PICK);
         return sendManageList(ctx, user);
       }
       return showProfile(ctx);
     case SCREEN.MANAGE_ADDRESS: {
       if (!user || !session.selectedAddressId) {
+        await ensureFlowState(userId, FLOW_STATES.AWAIT_MANAGE_PICK);
         return sendManageList(ctx, user || { addresses: [] });
       }
-      const address = (user.addresses || []).find(
+      const address = getAddresses(user).find(
         (addr) => addr.id === session.selectedAddressId
       );
       if (address) {
+        await ensureFlowState(userId, FLOW_STATES.AWAIT_MANAGE_ACTION);
         return sendManageAddressCard(ctx, address);
       }
+      await ensureFlowState(userId, FLOW_STATES.AWAIT_MANAGE_PICK);
       return sendManageList(ctx, user);
     }
     case SCREEN.LAST_ORDER:
       return showLastOrder(ctx);
     case SCREEN.SUPPORT:
       return sendSupportPrompt(ctx);
+    case SCREEN.TICKETS:
+      await ensureFlowState(userId, FLOW_STATES.AWAIT_TICKET_PICK);
+      return sendMyTickets(ctx);
     default:
       return sendMainMenu(ctx);
   }
 };
 
 const handleHome = async (ctx) => {
-  resetSession(ctx.chat.id);
-  await saveSessionData(ctx.from.id, {
-    state: FLOW_STATES.IDLE,
-    temp: {},
-    nav: [SCREEN.HOME],
-  });
+  await deleteSessionData(ctx.from.id);
   return sendMainMenu(ctx);
 };
 
@@ -1415,8 +1818,56 @@ const handleBack = async (ctx) => {
   return renderScreen(ctx, target);
 };
 
+async function handleNewTicketConfirm(ctx, session, handlers) {
+  const pending = session.temp?.pending;
+  if (ctx.message?.text === BTN_MY_TICKETS) {
+    return sendMyTickets(ctx);
+  }
+  if (ctx.message?.text === BTN_SUPPORT) {
+    return sendSupportPrompt(ctx);
+  }
+  if (ctx.message?.text === BTN_CANCEL_GENERIC) {
+    return sendMainMenu(ctx);
+  }
+  if (ctx.message?.text === BTN_OPEN_ANOTHER) {
+    await saveSessionData(ctx.from.id, { state: FLOW_STATES.IDLE, temp: {} });
+    return sendMainMenu(ctx);
+  }
+  if (ctx.message?.text === BTN_OPEN_THIS) {
+    await saveSessionData(ctx.from.id, { state: FLOW_STATES.IDLE, temp: {} });
+    if (pending?.type === "food" && pending.optionLabel && handlers?.startFood) {
+      return handlers.startFood(pending.optionLabel);
+    }
+    if (pending?.type === "flight" && handlers?.startFlight) {
+      return handlers.startFlight();
+    }
+    if (pending?.type === "hotel" && handlers?.startHotel) {
+      return handlers.startHotel();
+    }
+    return sendMainMenu(ctx);
+  }
+  return promptOpenAnother(ctx, pending || { type: "menu" });
+}
+
+async function handleTicketPick(ctx) {
+  const text = ctx.message?.text || "";
+  const match = text.match(/Ticket\s*#(\d+)/i);
+  if (!match) {
+    return sendMyTickets(ctx);
+  }
+  const ticketId = Number(match[1]);
+  const ticket = tickets.get(ticketId);
+  if (!ticket || ticket.status !== "open" || ticket.chatId !== ctx.chat.id) {
+    return safeReply(ctx, "That ticket is no longer active.");
+  }
+  const summary = formatTicketSummary(ticket);
+  return safeReply(ctx, `🎟 Ticket #${ticketId}\n\n${summary}\n\nStatus: OPEN`);
+}
+
 const handleProfileFlow = async (ctx, session) => {
-  const text = ctx.message.text.trim();
+  const rawText =
+    ctx.message && typeof ctx.message.text === "string" ? ctx.message.text : "";
+  const text = rawText.trim();
   const userId = ctx.from.id;
   const user = getUser(userId) || { addresses: [] };
 
@@ -1430,6 +1881,20 @@ const handleProfileFlow = async (ctx, session) => {
   if (text === BTN_PROFILE) {
     return showProfile(ctx);
   }
+  if (text === BTN_MANAGE || text === BTN_MANAGE_ADDR) {
+    await saveSessionData(userId, {
+      ...session,
+      state: FLOW_STATES.AWAIT_MANAGE_PICK,
+      temp: {
+        ...(session.temp || {}),
+        returnTo: session.temp?.returnTo || "profile",
+      },
+    });
+    return sendManageList(ctx, user);
+  }
+  if (text === BTN_MY_TICKETS) {
+    return sendMyTickets(ctx);
+  }
 
   switch (session.state) {
     case FLOW_STATES.AWAIT_PROFILE_CHOICE: {
@@ -1439,35 +1904,48 @@ const handleProfileFlow = async (ctx, session) => {
           state: FLOW_STATES.AWAIT_NAME,
           temp: {},
         });
-        return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Full name?", backHomeKeyboard());
       }
       if (text === BTN_SKIP) {
         await deleteSessionData(userId);
         return startLegacyFoodFlow(ctx, session.selectedOption);
       }
-      if (text === BTN_BACK) {
-        await deleteSessionData(userId);
-        return sendMainMenu(ctx);
+      if (text && text !== BTN_CREATE_PROFILE && text !== BTN_SKIP) {
+        return safeReply(ctx, 
+          "Tap 💾 Create Profile to save your details (or Skip for now).",
+          profilePromptKeyboard()
+        );
       }
       return sendProfilePrompt(ctx, session.selectedOption);
     }
+    case FLOW_STATES.AWAIT_NEW_TICKET_CONFIRM: {
+      return handleNewTicketConfirm(ctx, session, {
+        startFood: (optionLabel) =>
+          handleFoodOption(ctx, optionLabel, { bypassTicketPrompt: true }),
+        startFlight: () => startFlightFlow(ctx, setSession),
+        startHotel: () => startHotelFlow(ctx, setSession),
+      });
+    }
+    case FLOW_STATES.AWAIT_TICKET_PICK: {
+      return handleTicketPick(ctx);
+    }
     case FLOW_STATES.AWAIT_NAME: {
       if (!text) {
-        return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Full name?", backHomeKeyboard());
       }
       await saveSessionData(userId, {
         ...session,
         state: FLOW_STATES.AWAIT_PHONE,
         temp: { name: text },
       });
-      return ctx.reply(
+      return safeReply(ctx, 
         "📞 Your phone number? (US only)\nExample: 555-123-4567",
         backHomeKeyboard()
       );
     }
     case FLOW_STATES.AWAIT_PHONE: {
       if (!text) {
-        return ctx.reply(
+        return safeReply(ctx, 
           "📞 Your phone number? (US only)\nExample: 555-123-4567",
           backHomeKeyboard()
         );
@@ -1477,15 +1955,15 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_ADDRESS_TEXT,
         temp: { ...session.temp, phone: text },
       });
-      return ctx.reply(
-        "📍 Send your delivery address\n(include Apt/Flat + Zip + Gate code if any)",
+      return safeReply(ctx, 
+        "📍 Delivery address (include Apt/Zip/Gate code if any)",
         backHomeKeyboard()
       );
     }
     case FLOW_STATES.AWAIT_ADDRESS_TEXT: {
       if (!text) {
-        return ctx.reply(
-          "📍 Send your delivery address\n(include Apt/Flat + Zip + Gate code if any)",
+        return safeReply(ctx, 
+          "📍 Delivery address (include Apt/Zip/Gate code if any)",
           backHomeKeyboard()
         );
       }
@@ -1494,7 +1972,7 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_ADDRESS_LABEL,
         temp: { ...session.temp, addressText: text },
       });
-      return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+      return safeReply(ctx, "🏷️ Label this address:", addressLabelKeyboard());
     }
     case FLOW_STATES.AWAIT_ADDRESS_LABEL: {
       if (text === LABEL_CANCEL) {
@@ -1506,28 +1984,33 @@ const handleProfileFlow = async (ctx, session) => {
           ...session,
           state: FLOW_STATES.AWAIT_ADDRESS_LABEL_CUSTOM,
         });
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
       const label = resolveLabelChoice(text, user);
       if (!label) {
-        return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+        return safeReply(ctx, "🏷️ Label this address:", addressLabelKeyboard());
       }
       const addressId = createAddressId(user);
       const contactName = session.temp?.name || user.name || "-";
       const contactPhone = session.temp?.phone || user.phone || "-";
+      const baseUser = getUser(userId) || {};
+      const baseAddresses = Array.isArray(baseUser.addresses)
+        ? baseUser.addresses
+        : [];
+      const newAddress = {
+        id: addressId,
+        label: label,
+        text: session.temp?.addressText || "",
+        name: contactName,
+        phone: contactPhone,
+      };
+      const mergedAddresses = [...baseAddresses, newAddress].slice(0, 4);
       const updated = {
-        name: session.temp?.name || user.name,
-        phone: session.temp?.phone || user.phone,
-        addresses: [
-          {
-            id: addressId,
-            label: label,
-            text: session.temp?.addressText || "",
-            name: contactName,
-            phone: contactPhone,
-          },
-        ],
-        defaultAddressId: addressId,
+        ...baseUser,
+        name: session.temp?.name || baseUser.name,
+        phone: session.temp?.phone || baseUser.phone,
+        addresses: mergedAddresses,
+        defaultAddressId: baseUser.defaultAddressId || addressId,
       };
       await saveUser(userId, updated);
       await saveSessionData(userId, {
@@ -1535,31 +2018,36 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_PROFILE_POST_SAVE,
         temp: {},
       });
-      return ctx.reply(
-        "✅ Profile saved!\n\nYou can save up to 4 addresses.\nWant to add another now?",
+      return safeReply(ctx, 
+        "✅ Saved.\nYou can store up to 4 addresses.\nAdd another now?",
         profileSavedKeyboard(Boolean(session.selectedOption))
       );
     }
     case FLOW_STATES.AWAIT_ADDRESS_LABEL_CUSTOM: {
       if (!text) {
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
       const addressId = createAddressId(user);
       const contactName = session.temp?.name || user.name || "-";
       const contactPhone = session.temp?.phone || user.phone || "-";
+      const baseUser = getUser(userId) || {};
+      const baseAddresses = Array.isArray(baseUser.addresses)
+        ? baseUser.addresses
+        : [];
+      const newAddress = {
+        id: addressId,
+        label: text.trim(),
+        text: session.temp?.addressText || "",
+        name: contactName,
+        phone: contactPhone,
+      };
+      const mergedAddresses = [...baseAddresses, newAddress].slice(0, 4);
       const updated = {
-        name: session.temp?.name || user.name,
-        phone: session.temp?.phone || user.phone,
-        addresses: [
-          {
-            id: addressId,
-            label: text.trim(),
-            text: session.temp?.addressText || "",
-            name: contactName,
-            phone: contactPhone,
-          },
-        ],
-        defaultAddressId: addressId,
+        ...baseUser,
+        name: session.temp?.name || baseUser.name,
+        phone: session.temp?.phone || baseUser.phone,
+        addresses: mergedAddresses,
+        defaultAddressId: baseUser.defaultAddressId || addressId,
       };
       await saveUser(userId, updated);
       await saveSessionData(userId, {
@@ -1567,29 +2055,34 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_PROFILE_POST_SAVE,
         temp: {},
       });
-      return ctx.reply(
-        "✅ Profile saved!\n\nYou can save up to 4 addresses.\nWant to add another now?",
+      return safeReply(ctx, 
+        "✅ Saved.\nYou can store up to 4 addresses.\nAdd another now?",
         profileSavedKeyboard(Boolean(session.selectedOption))
       );
     }
     case FLOW_STATES.AWAIT_PROFILE_POST_SAVE: {
       if (text === BTN_ADD_ADDRESS) {
-        const existing = user.addresses || [];
+        const existing = getAddresses(user);
         if (existing.length >= 4) {
-          return ctx.reply(
-            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-            Markup.keyboard([
-              [Markup.button.text(BTN_MANAGE_ADDR)],
-              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-            ]).resize()
+          await saveSessionData(userId, {
+            ...session,
+            state: FLOW_STATES.AWAIT_MANAGE_PICK,
+            temp: {
+              ...(session.temp || {}),
+              returnTo: session.selectedOption ? "picker" : "profile",
+            },
+          });
+          await safeReply(ctx, 
+            "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
           );
+          return sendManageList(ctx, user);
         }
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_ADD_NAME,
           temp: { returnTo: "order" },
         });
-        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
       }
       if (text === "Continue Order") {
         if (!session.selectedOption) {
@@ -1597,52 +2090,45 @@ const handleProfileFlow = async (ctx, session) => {
           return sendMainMenu(ctx);
         }
         const refreshed = getUser(userId);
-        if (refreshed && refreshed.addresses?.length) {
-          if (refreshed.addresses.length === 1) {
+        if (refreshed && getAddresses(refreshed).length) {
+          if (getAddresses(refreshed).length === 1) {
             return sendSingleAddressPrompt(
               ctx,
               session.selectedOption,
               refreshed,
-              refreshed.addresses[0]
+              getAddresses(refreshed)[0]
             );
           }
           return sendAddressPicker(ctx, session.selectedOption, refreshed);
         }
       }
-      return ctx.reply(
+      return safeReply(ctx, 
         "Choose an option to continue.",
         profileSavedKeyboard(Boolean(session.selectedOption))
       );
     }
     case FLOW_STATES.AWAIT_ADDRESS_PICK: {
-      if (text === BTN_BACK) {
-        await deleteSessionData(userId);
-        return sendMainMenu(ctx);
-      }
       if (text === BTN_ADD_ADDRESS) {
-        const existing = user.addresses || [];
+        const existing = getAddresses(user);
         if (existing.length >= 4) {
           await saveSessionData(userId, {
             ...session,
-            state: FLOW_STATES.AWAIT_ADD_NAME,
-            temp: { returnTo: "picker" },
+            state: FLOW_STATES.AWAIT_MANAGE_PICK,
+            temp: { ...(session.temp || {}), returnTo: "picker" },
           });
-          return ctx.reply(
-            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-            Markup.keyboard([
-              [Markup.button.text(BTN_MANAGE_ADDR)],
-              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-            ]).resize()
+          await safeReply(ctx, 
+            "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
           );
+          return sendManageList(ctx, user);
         }
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_ADD_NAME,
           temp: { returnTo: "picker" },
         });
-        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
       }
-      if (text === BTN_MANAGE) {
+      if (text === BTN_MANAGE || text === BTN_MANAGE_ADDR) {
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_MANAGE_PICK,
@@ -1651,9 +2137,9 @@ const handleProfileFlow = async (ctx, session) => {
         return sendManageList(ctx, user);
       }
       if (text === BTN_USE_DEFAULT || text === BTN_CHOOSE_ANOTHER) {
-        const addresses = user.addresses || [];
+        const addresses = getAddresses(user);
         if (!addresses.length) {
-          return ctx.reply("No saved addresses yet.");
+          return safeReply(ctx, "No saved addresses yet.");
         }
         if (text === BTN_USE_DEFAULT) {
           const addr =
@@ -1673,18 +2159,10 @@ const handleProfileFlow = async (ctx, session) => {
         }
         return sendAddressPicker(ctx, session.selectedOption, user);
       }
-      if (text === BTN_MANAGE_ADDR) {
-        await saveSessionData(userId, {
-          ...session,
-          state: FLOW_STATES.AWAIT_MANAGE_PICK,
-          temp: { returnTo: "picker" },
-        });
-        return sendManageList(ctx, user);
-      }
       const chosenLabel = stripButtonLabel(text);
       const address = findAddressByLabel(user, chosenLabel);
       if (!address) {
-        return ctx.reply("📍 Choose an address:", addressPickerKeyboard(user));
+        return safeReply(ctx, "📍 Choose an address:", addressPickerKeyboard(user));
       }
       await saveSessionData(userId, {
         ...session,
@@ -1700,21 +2178,21 @@ const handleProfileFlow = async (ctx, session) => {
     }
     case FLOW_STATES.AWAIT_ADD_NAME: {
       if (!text) {
-        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
       }
       await saveSessionData(userId, {
         ...session,
         state: FLOW_STATES.AWAIT_ADD_PHONE,
         temp: { ...session.temp, addressName: text },
       });
-      return ctx.reply(
+      return safeReply(ctx, 
         "📞 Phone for this address? (US only)\nExample: 555-123-4567",
         backHomeKeyboard()
       );
     }
     case FLOW_STATES.AWAIT_ADD_PHONE: {
       if (!text) {
-        return ctx.reply(
+        return safeReply(ctx, 
           "📞 Phone for this address? (US only)\nExample: 555-123-4567",
           backHomeKeyboard()
         );
@@ -1724,29 +2202,26 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_ADD_ADDRESS_TEXT,
         temp: { ...session.temp, addressPhone: text },
       });
-      return ctx.reply(
+      return safeReply(ctx, 
         "📍 Send the new address\n(include Apt/Zip/Gate code)",
         backHomeKeyboard()
       );
     }
     case FLOW_STATES.AWAIT_ADD_ADDRESS_TEXT: {
-      const existing = user.addresses || [];
+      const existing = getAddresses(user);
       if (existing.length >= 4) {
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_MANAGE_PICK,
-          temp: { returnTo: session.temp?.returnTo || "profile" },
+          temp: { ...(session.temp || {}), returnTo: session.temp?.returnTo || "profile" },
         });
-        return ctx.reply(
-          "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-          Markup.keyboard([
-            [Markup.button.text(BTN_MANAGE_ADDR)],
-            [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-          ]).resize()
+        await safeReply(ctx, 
+          "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
         );
+        return sendManageList(ctx, user);
       }
       if (!text) {
-        return ctx.reply(
+        return safeReply(ctx, 
           "📍 Send the new address\n(include Apt/Zip/Gate code)",
           backHomeKeyboard()
         );
@@ -1756,7 +2231,7 @@ const handleProfileFlow = async (ctx, session) => {
         state: FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL,
         temp: { ...session.temp, addressText: text },
       });
-      return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+      return safeReply(ctx, "🏷️ Label this address:", addressLabelKeyboard());
     }
     case FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL: {
       if (text === LABEL_CANCEL) {
@@ -1768,24 +2243,24 @@ const handleProfileFlow = async (ctx, session) => {
           ...session,
           state: FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL_CUSTOM,
         });
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
       const label = resolveLabelChoice(text, user);
       if (!label) {
-        return ctx.reply("🏷️ Save this address as:", addressLabelKeyboard());
+        return safeReply(ctx, "🏷️ Label this address:", addressLabelKeyboard());
       }
       const addressId = createAddressId(user);
       const contactName =
         session.temp?.addressName || session.temp?.name || user.name || "-";
       const contactPhone =
         session.temp?.addressPhone || session.temp?.phone || user.phone || "-";
-      const addresses = (user.addresses || []).concat({
+      const addresses = getAddresses(user).concat({
         id: addressId,
         label: label,
         text: session.temp?.addressText || "",
         name: contactName,
         phone: contactPhone,
-      });
+      }).slice(0, 4);
       const updated = {
         ...user,
         addresses,
@@ -1797,7 +2272,7 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_ADDRESS_PICK,
       });
-      await ctx.reply("✅ Address added.\nPick an address to continue:");
+      await safeReply(ctx, "✅ Address added.\nPick an address to continue:");
       if (refreshed) {
         return sendAddressPicker(ctx, session.selectedOption, refreshed);
       }
@@ -1805,20 +2280,20 @@ const handleProfileFlow = async (ctx, session) => {
     }
     case FLOW_STATES.AWAIT_ADD_ADDRESS_LABEL_CUSTOM: {
       if (!text) {
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
       const addressId = createAddressId(user);
       const contactName =
         session.temp?.addressName || session.temp?.name || user.name || "-";
       const contactPhone =
         session.temp?.addressPhone || session.temp?.phone || user.phone || "-";
-      const addresses = (user.addresses || []).concat({
+      const addresses = getAddresses(user).concat({
         id: addressId,
         label: text.trim(),
         text: session.temp?.addressText || "",
         name: contactName,
         phone: contactPhone,
-      });
+      }).slice(0, 4);
       const updated = {
         ...user,
         addresses,
@@ -1830,40 +2305,35 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_ADDRESS_PICK,
       });
-      await ctx.reply("✅ Address added.\nPick an address to continue:");
+      await safeReply(ctx, "✅ Address added.\nPick an address to continue:");
       if (refreshed) {
         return sendAddressPicker(ctx, session.selectedOption, refreshed);
       }
       return sendMainMenu(ctx);
     }
     case FLOW_STATES.AWAIT_MANAGE_PICK: {
-      if (text === BTN_BACK) {
-        await deleteSessionData(userId);
-        if (session.temp?.returnTo === "picker" && session.selectedOption) {
-          return sendAddressPicker(ctx, session.selectedOption, user);
-        }
-        return showProfile(ctx);
-      }
-      if (text === BTN_MANAGE_ADDR) {
+      if (text === BTN_MANAGE || text === BTN_MANAGE_ADDR) {
         return sendManageList(ctx, user);
       }
       if (text === BTN_ADD_ADDRESS) {
-        const existing = user.addresses || [];
+        const existing = getAddresses(user);
         if (existing.length >= 4) {
-          return ctx.reply(
-            "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-            Markup.keyboard([
-              [Markup.button.text(BTN_MANAGE_ADDR)],
-              [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-            ]).resize()
+          await saveSessionData(userId, {
+            ...session,
+            state: FLOW_STATES.AWAIT_MANAGE_PICK,
+            temp: { ...(session.temp || {}), returnTo: session.temp?.returnTo || "profile" },
+          });
+          await safeReply(ctx, 
+            "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
           );
+          return sendManageList(ctx, user);
         }
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_ADD_NAME,
           temp: { returnTo: session.temp?.returnTo || "profile" },
         });
-        return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+        return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
       }
       const chosenLabel = stripButtonLabel(text);
       const address = findAddressByLabel(user, chosenLabel);
@@ -1878,7 +2348,7 @@ const handleProfileFlow = async (ctx, session) => {
       return sendManageAddressCard(ctx, address);
     }
     case FLOW_STATES.AWAIT_MANAGE_ACTION: {
-      const address = (user.addresses || []).find(
+      const address = getAddresses(user).find(
         (addr) => addr.id === session.selectedAddressId
       );
       if (!address) {
@@ -1894,7 +2364,7 @@ const handleProfileFlow = async (ctx, session) => {
           ...session,
           state: FLOW_STATES.AWAIT_MANAGE_PICK,
         });
-        await ctx.reply("✅ Default address updated.");
+        await safeReply(ctx, "✅ Default address updated.");
         return sendManageList(ctx, getUser(userId));
       }
       if (text === BTN_EDIT_ADDRESS) {
@@ -1902,36 +2372,29 @@ const handleProfileFlow = async (ctx, session) => {
           ...session,
           state: FLOW_STATES.AWAIT_EDIT_ADDRESS,
         });
-        return ctx.reply("✏️ Send the updated address text:", backHomeKeyboard());
+        return safeReply(ctx, "✏️ Send the updated address text:", backHomeKeyboard());
       }
       if (text === BTN_RENAME_LABEL) {
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_RENAME_LABEL,
         });
-        return ctx.reply("🏷️ Choose a new label:", addressLabelKeyboard());
+        return safeReply(ctx, "🏷️ Choose a new label:", addressLabelKeyboard());
       }
       if (text === BTN_DELETE_ADDRESS) {
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_DELETE_CONFIRM,
         });
-        return ctx.reply("🗑️ Delete this address?", deleteConfirmKeyboard());
-      }
-      if (text === BTN_BACK) {
-        await saveSessionData(userId, {
-          ...session,
-          state: FLOW_STATES.AWAIT_MANAGE_PICK,
-        });
-        return sendManageList(ctx, user);
+        return safeReply(ctx, "🗑️ Delete this address?", deleteConfirmKeyboard());
       }
       return sendManageAddressCard(ctx, address);
     }
     case FLOW_STATES.AWAIT_EDIT_ADDRESS: {
       if (!text) {
-        return ctx.reply("✏️ Send the updated address text:", backHomeKeyboard());
+        return safeReply(ctx, "✏️ Send the updated address text:", backHomeKeyboard());
       }
-      const addresses = (user.addresses || []).map((addr) =>
+      const addresses = getAddresses(user).map((addr) =>
         addr.id === session.selectedAddressId
           ? { ...addr, text: text.trim() }
           : addr
@@ -1941,7 +2404,7 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_MANAGE_PICK,
       });
-      await ctx.reply("✅ Address updated.");
+      await safeReply(ctx, "✅ Address updated.");
       return sendManageList(ctx, getUser(userId));
     }
     case FLOW_STATES.AWAIT_RENAME_LABEL: {
@@ -1952,7 +2415,7 @@ const handleProfileFlow = async (ctx, session) => {
         });
         return sendManageAddressCard(
           ctx,
-          (user.addresses || []).find(
+          getAddresses(user).find(
             (addr) => addr.id === session.selectedAddressId
           )
         );
@@ -1962,13 +2425,13 @@ const handleProfileFlow = async (ctx, session) => {
           ...session,
           state: FLOW_STATES.AWAIT_RENAME_LABEL_CUSTOM,
         });
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
       const label = resolveLabelChoice(text, user);
       if (!label) {
-        return ctx.reply("🏷️ Choose a new label:", addressLabelKeyboard());
+        return safeReply(ctx, "🏷️ Choose a new label:", addressLabelKeyboard());
       }
-      const addresses = (user.addresses || []).map((addr) =>
+      const addresses = getAddresses(user).map((addr) =>
         addr.id === session.selectedAddressId
           ? { ...addr, label }
           : addr
@@ -1978,14 +2441,14 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_MANAGE_PICK,
       });
-      await ctx.reply("✅ Label updated.");
+      await safeReply(ctx, "✅ Label updated.");
       return sendManageList(ctx, getUser(userId));
     }
     case FLOW_STATES.AWAIT_RENAME_LABEL_CUSTOM: {
       if (!text) {
-        return ctx.reply("Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
+        return safeReply(ctx, "Type a label (example: Hostel / Office2 / GF Home)", backHomeKeyboard());
       }
-      const addresses = (user.addresses || []).map((addr) =>
+      const addresses = getAddresses(user).map((addr) =>
         addr.id === session.selectedAddressId
           ? { ...addr, label: text.trim() }
           : addr
@@ -1995,7 +2458,7 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_MANAGE_PICK,
       });
-      await ctx.reply("✅ Label updated.");
+      await safeReply(ctx, "✅ Label updated.");
       return sendManageList(ctx, getUser(userId));
     }
     case FLOW_STATES.AWAIT_DELETE_CONFIRM: {
@@ -2007,9 +2470,9 @@ const handleProfileFlow = async (ctx, session) => {
         return sendManageList(ctx, user);
       }
       if (text !== BTN_DELETE_CONFIRM) {
-        return ctx.reply("🗑️ Delete this address?", deleteConfirmKeyboard());
+        return safeReply(ctx, "🗑️ Delete this address?", deleteConfirmKeyboard());
       }
-      const addresses = (user.addresses || []).filter(
+      const addresses = getAddresses(user).filter(
         (addr) => addr.id !== session.selectedAddressId
       );
       const defaultAddressId =
@@ -2021,7 +2484,7 @@ const handleProfileFlow = async (ctx, session) => {
         ...session,
         state: FLOW_STATES.AWAIT_MANAGE_PICK,
       });
-      await ctx.reply("✅ Address deleted.");
+      await safeReply(ctx, "✅ Address deleted.");
       return sendManageList(ctx, getUser(userId));
     }
     case FLOW_STATES.AWAIT_SUBTOTAL: {
@@ -2032,7 +2495,7 @@ const handleProfileFlow = async (ctx, session) => {
         });
         return sendAddressPicker(ctx, session.selectedOption, user);
       }
-      if (text === BTN_MANAGE) {
+      if (text === BTN_MANAGE || text === BTN_MANAGE_ADDR) {
         await saveSessionData(userId, {
           ...session,
           state: FLOW_STATES.AWAIT_MANAGE_PICK,
@@ -2040,20 +2503,28 @@ const handleProfileFlow = async (ctx, session) => {
         });
         return sendManageList(ctx, user);
       }
-      if (text === BTN_BACK) {
-        await deleteSessionData(userId);
-        return sendMainMenu(ctx);
-      }
       const subtotal = parseSubtotal(text);
       if (subtotal === null) {
-        return ctx.reply(
-          "✍️ Send subtotal (before tax/fees):\n(just type a number like 55 or $55)",
+        return safeReply(ctx, 
+          "💰 Send subtotal (before tax/fees)\nExample: 55",
+          subtotalKeyboard()
+        );
+      }
+      if (subtotal < 40) {
+        return safeReply(ctx, 
+          "⚠️ Min subtotal is $40.\nSend a new subtotal to continue.",
+          subtotalKeyboard()
+        );
+      }
+      if (subtotal > 100) {
+        return safeReply(ctx, 
+          "⚠️ Max subtotal is $100.\nSend a new subtotal to continue.",
           subtotalKeyboard()
         );
       }
       let address = null;
       if (session.selectedAddressId) {
-        address = (user.addresses || []).find(
+        address = getAddresses(user).find(
           (addr) => addr.id === session.selectedAddressId
         );
       }
@@ -2086,7 +2557,7 @@ const handleProfileFlow = async (ctx, session) => {
     case FLOW_STATES.AWAIT_CONFIRM: {
       let address = null;
       if (session.selectedAddressId) {
-        address = (user.addresses || []).find(
+        address = getAddresses(user).find(
           (addr) => addr.id === session.selectedAddressId
         );
       }
@@ -2103,9 +2574,18 @@ const handleProfileFlow = async (ctx, session) => {
       }
       if (text === BTN_SUBMIT_ORDER) {
         const subtotal = Number(session.temp?.subtotal || 0);
-        await finalizeOrder(ctx, session.selectedOption, user, address, subtotal);
-        await ctx.reply(
-          "✅ Submitted!\n\n⏳ Matching you with a concierge...\n⏱ Avg response: 1–5 mins",
+        const ticketId = await finalizeOrder(
+          ctx,
+          session.selectedOption,
+          user,
+          address,
+          subtotal
+        );
+        if (!ticketId) {
+          return;
+        }
+        await safeReply(ctx, 
+          "✅ Request opened\n⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min",
           Markup.removeKeyboard()
         );
         return;
@@ -2131,7 +2611,10 @@ const handleProfileFlow = async (ctx, session) => {
       }
       if (text === BTN_CANCEL_ORDER) {
         await deleteSessionData(userId);
-        await ctx.reply("❌ Canceled.", Markup.removeKeyboard());
+        await safeReply(ctx, 
+          "✅ Cancelled. No request was submitted.",
+          Markup.removeKeyboard()
+        );
         return sendQuickActions(ctx);
       }
       return sendConfirmCard(
@@ -2191,7 +2674,7 @@ const handleProfileFlow = async (ctx, session) => {
     }
     case FLOW_STATES.AWAIT_SUPPORT: {
       if (!text) {
-        return ctx.reply("Describe your issue in one message.");
+        return safeReply(ctx, "Describe your issue in one message.");
       }
       const userTag = ctx.from.username
         ? `@${ctx.from.username}`
@@ -2202,12 +2685,28 @@ const handleProfileFlow = async (ctx, session) => {
           .catch((err) => logError("support notify", err));
       });
       await deleteSessionData(userId);
-      await ctx.reply("✅ Thanks! A human will reply shortly.");
+      await safeReply(ctx, "✅ Thanks! A human will reply shortly.");
       return sendQuickActions(ctx);
     }
     default:
       return null;
   }
+};
+
+const handleTicketFlow = async (ctx, handlers) => {
+  const flowSession = getSessionData(ctx.from.id);
+  if (!flowSession) {
+    return false;
+  }
+  if (flowSession.state === FLOW_STATES.AWAIT_NEW_TICKET_CONFIRM) {
+    await handleNewTicketConfirm(ctx, flowSession, handlers);
+    return true;
+  }
+  if (flowSession.state === FLOW_STATES.AWAIT_TICKET_PICK) {
+    await handleTicketPick(ctx);
+    return true;
+  }
+  return false;
 };
 
 const confirmMenu = () =>
@@ -2302,9 +2801,7 @@ const formatTicketLine = (ticketId, ticket) => {
 };
 
 const completionThankYou = (ticketId) =>
-  `${emphasizeHtml(`Order #${ticketId} complete.`)}\n${emphasizeHtml(
-    "Thank you for choosing Allat50. We appreciate your business."
-  )}`;
+  `🔒 Ticket #${ticketId} closed.\nType menu to start again.`;
 
 const formatClosedLine = (ticketId, record) => {
   const profit = Number(record.profit) || 0;
@@ -2429,17 +2926,53 @@ const summarizeReport = () => {
   return totals;
 };
 
-const getOpenTicketByChat = (chatId) => {
-  const ticketId = customerTickets.get(chatId);
-  if (!ticketId) {
-    return null;
+function getOpenTicketIdsForChat(chatId) {
+  const ids = customerTickets.get(chatId);
+  if (!Array.isArray(ids)) {
+    return [];
   }
-  const ticket = tickets.get(ticketId);
-  if (!ticket || ticket.status !== "open") {
+  return ids
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id))
+    .filter((id) => {
+      const ticket = tickets.get(id);
+      return ticket && ticket.status === "open";
+    });
+}
+
+function addOpenTicketForChat(chatId, ticketId) {
+  const ids = getOpenTicketIdsForChat(chatId);
+  if (!ids.includes(ticketId)) {
+    ids.push(ticketId);
+  }
+  customerTickets.set(chatId, ids);
+}
+
+function removeOpenTicketForChat(chatId, ticketId) {
+  const ids = getOpenTicketIdsForChat(chatId).filter((id) => id !== ticketId);
+  if (ids.length) {
+    customerTickets.set(chatId, ids);
+  } else {
     customerTickets.delete(chatId);
+  }
+}
+
+const openTicketCountForChat = (chatId) => getOpenTicketIdsForChat(chatId).length;
+
+const canOpenAnotherTicket = (chatId) =>
+  openTicketCountForChat(chatId) < MAX_OPEN_TICKETS_PER_CHAT;
+
+const getOpenTicketByChat = (chatId) => {
+  const ids = getOpenTicketIdsForChat(chatId);
+  if (!ids.length) {
     return null;
   }
-  return { ticketId, ticket };
+  const latest = Math.max(...ids);
+  const ticket = tickets.get(latest);
+  if (!ticket || ticket.status !== "open") {
+    return null;
+  }
+  return { ticketId: latest, ticket };
 };
 
 const closeTicketsForChat = (chatId, closeType, closedBy) => {
@@ -2448,9 +2981,9 @@ const closeTicketsForChat = (chatId, closeType, closedBy) => {
       ticket.status = "closed";
       tickets.set(ticketId, ticket);
       closeTicketRecord(ticketId, { closeType, closedBy });
+      removeOpenTicketForChat(chatId, ticketId);
     }
   }
-  customerTickets.delete(chatId);
 };
 
 const forwardCustomerMessage = async (telegram, ctx, ticketId, ticket) => {
@@ -2629,15 +3162,19 @@ const createSessionStore = (telegram) => {
 };
 
 const replyHtml = (ctx, text, extra = {}) =>
-  ctx.reply(text, { parse_mode: "HTML", ...extra });
+  safeReplyHtml(ctx, text, extra);
 
 const sendHome = async (ctx, caption, keyboard) => {
   if (LOGO_BYTES) {
     try {
-      return await ctx.replyWithPhoto(
+      const sent = await safeReplyPhoto(
+        ctx,
         { source: LOGO_BYTES },
         { caption, parse_mode: "HTML", ...keyboard }
       );
+      if (sent) {
+        return sent;
+      }
     } catch (_) {
       return replyHtml(ctx, caption, keyboard);
     }
@@ -2709,6 +3246,9 @@ const checkRateLimit = (userId) => {
 };
 
 bot.start((ctx) => {
+  if (openTicketCountForChat(ctx.chat.id) > 0) {
+    return promptOpenAnother(ctx, { type: "menu" });
+  }
   resetSession(ctx.chat.id);
   saveSessionData(ctx.from.id, {
     state: FLOW_STATES.IDLE,
@@ -2795,7 +3335,7 @@ const parseCloseInput = (text, hasCommand = false) => {
 const closeTicketWithValues = (ctx, ticketId, profit, remarks) => {
   const ticket = tickets.get(ticketId);
   if (ticket && ticket.status === "closed") {
-    return ctx.reply("Ticket already closed.");
+    return safeReply(ctx, "Ticket already closed.");
   }
 
   const duffCut = Number((profit * duffCutRate).toFixed(2));
@@ -2808,7 +3348,7 @@ const closeTicketWithValues = (ctx, ticketId, profit, remarks) => {
   });
 
   if (!updated) {
-    return ctx.reply("Ticket not found.");
+    return safeReply(ctx, "Ticket not found.");
   }
 
   const record = ticketRecords.get(ticketId);
@@ -2818,7 +3358,7 @@ const closeTicketWithValues = (ctx, ticketId, profit, remarks) => {
     tickets.set(ticketId, ticket);
   }
   if (chatId) {
-    customerTickets.delete(chatId);
+    removeOpenTicketForChat(chatId, ticketId);
     ctx.telegram
       .sendMessage(chatId, completionThankYou(ticketId), { parse_mode: "HTML" })
       .catch(() => {});
@@ -2838,7 +3378,7 @@ const closeTicketWithValues = (ctx, ticketId, profit, remarks) => {
   }
 
   refreshWorkerLists(ctx.telegram);
-  return ctx.reply(
+  return safeReply(ctx, 
     `Ticket #${ticketId} closed. Profit: $${profit.toFixed(
       2
     )} · Duff: $${duffCut.toFixed(2)}`
@@ -2851,7 +3391,7 @@ bot.command("close", (ctx) => {
   }
   const parsed = parseCloseInput(ctx.message.text, true);
   if (!parsed) {
-    return ctx.reply('Usage: /close <ticket_id> <profit> "remarks"');
+    return safeReply(ctx, 'Usage: /close <ticket_id> <profit> "remarks"');
   }
   return closeTicketWithValues(ctx, parsed.ticketId, parsed.profit, parsed.remarks);
 });
@@ -2863,12 +3403,12 @@ bot.command("ban", (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const chatId = Number(parts[1]);
   if (!Number.isFinite(chatId)) {
-    return ctx.reply("Usage: /ban <chat_id>");
+    return safeReply(ctx, "Usage: /ban <chat_id>");
   }
   bannedChatIds.add(chatId);
   closeTicketsForChat(chatId, "banned", adminAlias(ctx));
   saveConfig();
-  return ctx.reply(`Chat ${chatId} banned.`);
+  return safeReply(ctx, `Chat ${chatId} banned.`);
 });
 
 bot.command("unban", (ctx) => {
@@ -2878,14 +3418,14 @@ bot.command("unban", (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const chatId = Number(parts[1]);
   if (!Number.isFinite(chatId)) {
-    return ctx.reply("Usage: /unban <chat_id>");
+    return safeReply(ctx, "Usage: /unban <chat_id>");
   }
   if (!bannedChatIds.has(chatId)) {
-    return ctx.reply("Chat is not banned.");
+    return safeReply(ctx, "Chat is not banned.");
   }
   bannedChatIds.delete(chatId);
   saveConfig();
-  return ctx.reply(`Chat ${chatId} unbanned.`);
+  return safeReply(ctx, `Chat ${chatId} unbanned.`);
 });
 
 const registerAdminReplyHandler = (botInstance, botKey) => {
@@ -2908,7 +3448,7 @@ const registerAdminReplyHandler = (botInstance, botKey) => {
 
     const ticket = tickets.get(entry.ticketId);
     if (!ticket || ticket.status !== "open") {
-      await ctx.reply("Ticket is closed or no longer exists.");
+      await safeReply(ctx, "Ticket is closed or no longer exists.");
       return;
     }
 
@@ -2958,19 +3498,19 @@ const registerDuffReplyHandler = (botInstance) => {
 
     const ticket = tickets.get(entry.ticketId);
     if (!ticket || ticket.status !== "open") {
-      await ctx.reply("Ticket is closed or no longer exists.");
+      await safeReply(ctx, "Ticket is closed or no longer exists.");
       return;
     }
 
     const adminId = ticket.assignedAdminId;
     if (!adminId) {
-      await ctx.reply("No worker assigned yet. Ask them to /accept first.");
+      await safeReply(ctx, "No worker assigned yet. Ask them to /accept first.");
       return;
     }
 
     const logText = ctx.message?.text;
     if (!logText) {
-      await ctx.reply("Please send log text.");
+      await safeReply(ctx, "Please send log text.");
       return;
     }
 
@@ -2990,7 +3530,7 @@ const registerDuffReplyHandler = (botInstance) => {
       `${emphasizeHtml(`Log for ticket #${entry.ticketId}`)}\n<code>${safeLog}</code>`,
       { parse_mode: "HTML" }
     );
-    await ctx.reply(emphasizeHtml("Log sent to the worker."), {
+    await safeReply(ctx, emphasizeHtml("Log sent to the worker."), {
       parse_mode: "HTML",
     });
   });
@@ -3024,7 +3564,7 @@ const workerPanelAction = async (ctx) => {
       reply_markup: workerPanelKeyboard().reply_markup,
     });
   } catch (_) {
-    await ctx.reply(text, { parse_mode: "HTML", reply_markup: workerPanelKeyboard().reply_markup });
+    await safeReply(ctx, text, { parse_mode: "HTML", reply_markup: workerPanelKeyboard().reply_markup });
   }
 };
 
@@ -3047,7 +3587,7 @@ const workerViewAction = async (ctx) => {
     });
     workerListMessages.set(ctx.chat.id, ctx.callbackQuery.message.message_id);
   } catch (_) {
-    const sent = await ctx.reply(text, {
+    const sent = await safeReply(ctx, text, {
       parse_mode: "HTML",
       reply_markup: workerListKeyboard(openTickets).reply_markup,
     });
@@ -3062,7 +3602,7 @@ const workerCloseAction = async (ctx) => {
   }
   adminPrompts.set(ctx.chat.id, { action: "close" });
   await ctx.answerCbQuery();
-  await ctx.reply('Send: <code>&lt;ticket_id&gt; &lt;profit&gt; "remarks"</code>', {
+  await safeReply(ctx, 'Send: <code>&lt;ticket_id&gt; &lt;profit&gt; "remarks"</code>', {
     parse_mode: "HTML",
   });
 };
@@ -3074,7 +3614,7 @@ const workerAliasAction = async (ctx) => {
   }
   adminPrompts.set(ctx.chat.id, { action: "alias" });
   await ctx.answerCbQuery();
-  await ctx.reply("Send your new alias.");
+  await safeReply(ctx, "Send your new alias.");
 };
 
 const adminPromptHandler = async (ctx, next) => {
@@ -3100,19 +3640,19 @@ const adminPromptHandler = async (ctx, next) => {
   if (prompt.action === "alias") {
     const alias = ctx.message.text.trim();
     if (!alias) {
-      await ctx.reply("Alias cannot be empty.");
+      await safeReply(ctx, "Alias cannot be empty.");
       return;
     }
     adminAliases[ctx.chat.id] = alias;
     saveConfig();
     adminPrompts.delete(ctx.chat.id);
-    await ctx.reply(`Alias set to: ${alias}`);
+    await safeReply(ctx, `Alias set to: ${alias}`);
     return;
   }
   if (prompt.action === "close") {
     const parsed = parseCloseInput(ctx.message.text, false);
     if (!parsed) {
-      await ctx.reply('Usage: <ticket_id> <profit> "remarks"');
+      await safeReply(ctx, 'Usage: <ticket_id> <profit> "remarks"');
       return;
     }
     adminPrompts.delete(ctx.chat.id);
@@ -3128,11 +3668,11 @@ const setnameCommand = (ctx) => {
   parts.shift();
   const alias = parts.join(" ").trim();
   if (!alias) {
-    return ctx.reply("Usage: /setname <alias>");
+    return safeReply(ctx, "Usage: /setname <alias>");
   }
   adminAliases[ctx.chat.id] = alias;
   saveConfig();
-  return ctx.reply(`Alias set to: ${alias}`);
+  return safeReply(ctx, `Alias set to: ${alias}`);
 };
 
 const assignTicket = (ticketId, adminId, alias) => {
@@ -3209,12 +3749,12 @@ const acceptCommand = (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const ticketId = Number(parts[1]);
   if (!Number.isFinite(ticketId)) {
-    return ctx.reply("Usage: /accept <ticket_id>");
+    return safeReply(ctx, "Usage: /accept <ticket_id>");
   }
   const alias = adminAlias(ctx);
   const result = assignTicket(ticketId, ctx.chat.id, alias);
   if (!result.ok) {
-    return ctx.reply(
+    return safeReply(ctx, 
       result.reason === "assigned"
         ? "Ticket already accepted by another worker."
         : "Ticket not found or already closed."
@@ -3222,7 +3762,7 @@ const acceptCommand = (ctx) => {
   }
   updateAdminTicketMessages(ticketId, ctx.chat.id, ctx.telegram);
   refreshWorkerLists(ctx.telegram);
-  return ctx.reply(`Ticket #${ticketId} accepted as ${alias}.`);
+  return safeReply(ctx, `Ticket #${ticketId} accepted as ${alias}.`);
 };
 
 const duffPanel = (ctx) => {
@@ -3290,16 +3830,16 @@ const logCommand = (ctx) => {
   }
   const match = ctx.message.text.trim().match(/^\/log\s+(\d+)\s+([\s\S]+)$/i);
   if (!match) {
-    return ctx.reply("Usage: /log <ticket_id> <log text>");
+    return safeReply(ctx, "Usage: /log <ticket_id> <log text>");
   }
   const ticketId = Number(match[1]);
   const logText = match[2].trim();
   const ticket = tickets.get(ticketId);
   if (!ticket || ticket.status !== "open") {
-    return ctx.reply("Ticket not found or closed.");
+    return safeReply(ctx, "Ticket not found or closed.");
   }
   if (!ticket.assignedAdminId) {
-    return ctx.reply("No worker assigned yet. Ask them to /accept first.");
+    return safeReply(ctx, "No worker assigned yet. Ask them to /accept first.");
   }
   const duffName = ctx.from?.first_name || "Duff";
   ticket.couponProvidedBy = duffName;
@@ -3319,7 +3859,7 @@ const logCommand = (ctx) => {
       { parse_mode: "HTML" }
     )
     .catch(() => {});
-  return ctx.reply(emphasizeHtml("Log sent to the worker."), {
+  return safeReply(ctx, emphasizeHtml("Log sent to the worker."), {
     parse_mode: "HTML",
   });
 };
@@ -3390,7 +3930,7 @@ const requestCoupon = async (ctx, ticketId) => {
   });
 
   await ctx.answerCbQuery("Log request sent to Duff.");
-  await ctx.reply(emphasizeHtml("Log request sent to Duff manager."), {
+  await safeReply(ctx, emphasizeHtml("Log request sent to Duff manager."), {
     parse_mode: "HTML",
   });
 };
@@ -3451,7 +3991,7 @@ const handlePaidAction = async (ctx) => {
     paidBy: alias,
   });
   await ctx.answerCbQuery("Marked paid.");
-  await ctx.reply(`Ticket #${ticketId} marked paid.`);
+  await safeReply(ctx, `Ticket #${ticketId} marked paid.`);
 };
 
 const handleCloseAction = async (ctx) => {
@@ -3469,14 +4009,14 @@ const handleCloseAction = async (ctx) => {
 
   ticket.status = "closed";
   tickets.set(ticketId, ticket);
-  customerTickets.delete(ticket.chatId);
+  removeOpenTicketForChat(ticket.chatId, ticketId);
   closeTicketRecord(ticketId, {
     closeType: "manual_close",
     closedBy: adminAlias(ctx),
   });
 
   await ctx.answerCbQuery("Ticket closed.");
-  await ctx.reply(`Ticket #${ticketId} closed.`);
+  await safeReply(ctx, `Ticket #${ticketId} closed.`);
   await refreshWorkerLists(ctx.telegram);
   return ctx.telegram.sendMessage(
     ticket.chatId,
@@ -3503,14 +4043,14 @@ const handleBanAction = async (ctx) => {
 
   ticket.status = "closed";
   tickets.set(ticketId, ticket);
-  customerTickets.delete(ticket.chatId);
+  removeOpenTicketForChat(ticket.chatId, ticketId);
   closeTicketRecord(ticketId, {
     closeType: "banned",
     closedBy: adminAlias(ctx),
   });
 
   await ctx.answerCbQuery("Customer banned.");
-  await ctx.reply(`Ticket #${ticketId} closed and customer banned.`);
+  await safeReply(ctx, `Ticket #${ticketId} closed and customer banned.`);
   await refreshWorkerLists(ctx.telegram);
   return ctx.telegram.sendMessage(
     ticket.chatId,
@@ -3675,7 +4215,7 @@ bot.action("confirm", async (ctx) => {
   }
 
   await ctx.answerCbQuery("Submitted");
-  await ctx.reply(
+  await safeReply(ctx, 
     "Thanks! Your request is queued. We'll follow up shortly."
   );
   resetSession(ctx.chat.id);
@@ -3701,6 +4241,12 @@ bot.on("text", async (ctx) => {
     BTN_BACK,
     BTN_HOME,
     BTN_CANCEL_ORDER,
+    BTN_MANAGE_ADDR,
+    BTN_MANAGE,
+    BTN_MY_TICKETS,
+    BTN_OPEN_ANOTHER,
+    BTN_OPEN_THIS,
+    BTN_CANCEL_GENERIC,
   ]);
   const isQuickAction = quickActionSet.has(messageText) || lowerText === "menu";
   if (
@@ -3742,7 +4288,10 @@ bot.on("text", async (ctx) => {
     if (legacySession) {
       resetSession(ctx.chat.id);
     }
-    await ctx.reply("❌ Canceled.", Markup.removeKeyboard());
+    await safeReply(ctx, 
+      "✅ Cancelled. No request was submitted.",
+      Markup.removeKeyboard()
+    );
     return;
   }
   if (messageText === BTN_HOME) {
@@ -3762,28 +4311,29 @@ bot.on("text", async (ctx) => {
         state: FLOW_STATES.AWAIT_NAME,
         temp: { returnTo: "menu" },
       });
-      return ctx.reply("👤 What’s your full name?", backHomeKeyboard());
+      return safeReply(ctx, "👤 Full name?", backHomeKeyboard());
     }
     const addresses = existing.addresses || [];
     if (addresses.length >= 4) {
-      return ctx.reply(
-        "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-        Markup.keyboard([
-          [Markup.button.text(BTN_MANAGE_ADDR)],
-          [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-        ]).resize()
+      await saveSessionData(ctx.from.id, {
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        temp: { returnTo: "profile" },
+      });
+      await safeReply(ctx, 
+        "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
       );
+      return sendManageList(ctx, existing);
     }
     await saveSessionData(ctx.from.id, {
       state: FLOW_STATES.AWAIT_ADD_NAME,
       temp: { returnTo: "profile" },
     });
-    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+    return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
   }
   if (messageText === BTN_EDIT_PROFILE_ADDR) {
     const existing = getUser(ctx.from.id);
     if (!existing) {
-      await ctx.reply("No profile saved yet.");
+      await safeReply(ctx, "No profile saved yet.");
       return sendQuickActions(ctx);
     }
     return showProfile(ctx);
@@ -3807,23 +4357,24 @@ bot.on("text", async (ctx) => {
     if (!user) {
       return showProfile(ctx);
     }
-    const addresses = user.addresses || [];
+    const addresses = getAddresses(user);
     if (addresses.length >= 4) {
-      return ctx.reply(
-        "⚠️ You already have 4 saved addresses.\nDelete or edit one to add a new address.",
-        Markup.keyboard([
-          [Markup.button.text(BTN_MANAGE_ADDR)],
-          [Markup.button.text(BTN_BACK), Markup.button.text(BTN_HOME)],
-        ]).resize()
+      await saveSessionData(ctx.from.id, {
+        state: FLOW_STATES.AWAIT_MANAGE_PICK,
+        temp: { returnTo: "profile" },
+      });
+      await safeReply(ctx, 
+        "⚠️ You already have 4 saved addresses.\nEdit or delete one to add a new address."
       );
+      return sendManageList(ctx, user);
     }
     await saveSessionData(ctx.from.id, {
       state: FLOW_STATES.AWAIT_ADD_NAME,
       temp: { returnTo: "profile" },
     });
-    return ctx.reply("👤 Name for this address?", backHomeKeyboard());
+    return safeReply(ctx, "👤 Name for this address?", backHomeKeyboard());
   }
-  if (messageText === BTN_MANAGE) {
+  if (messageText === BTN_MANAGE || messageText === BTN_MANAGE_ADDR) {
     const user = getUser(ctx.from.id);
     if (!user) {
       return showProfile(ctx);
@@ -3837,17 +4388,20 @@ bot.on("text", async (ctx) => {
   if (messageText === BTN_LAST_ORDER) {
     return showLastOrder(ctx);
   }
+  if (messageText === BTN_MY_TICKETS) {
+    return sendMyTickets(ctx);
+  }
   if (messageText === BTN_SUPPORT) {
     return sendSupportPrompt(ctx);
   }
   if (messageText === BTN_CHANNEL) {
-    await ctx.reply(`📢 Channel: ${CHANNEL_URL}`);
+    await safeReply(ctx, `📢 Channel: ${CHANNEL_URL}`);
     return sendQuickActions(ctx);
   }
   if (messageText === BTN_DELETE_PROFILE) {
     await deleteUser(ctx.from.id);
     await deleteSessionData(ctx.from.id);
-    return ctx.reply("✅ Profile deleted.", Markup.removeKeyboard());
+    return safeReply(ctx, "✅ Profile deleted.", Markup.removeKeyboard());
   }
 
   const session = legacySession;
@@ -3890,7 +4444,7 @@ bot.on("text", async (ctx) => {
       if (rateLimit.limited) {
         const minutes = Math.ceil(rateLimit.retryAfterMs / 60000);
         resetSession(ctx.chat.id);
-        return ctx.reply(
+        return safeReply(ctx, 
           `You're sending too many requests. Please try again in ${minutes} minute(s).`
         );
       }
@@ -3910,8 +4464,9 @@ bot.on("text", async (ctx) => {
         category: session.foodCategory,
         chatId: ctx.chat.id,
         botKey: "food",
+        answers: session.answers,
       });
-      customerTickets.set(ctx.chat.id, ticketId);
+      addOpenTicketForChat(ctx.chat.id, ticketId);
 
       const summary = formatFoodSummary(session);
       const userTag = ctx.from.username
@@ -3947,11 +4502,9 @@ bot.on("text", async (ctx) => {
       );
 
       resetSession(ctx.chat.id);
-      ctx.reply(
-        "🕘 You're being connected over to our workers! This could take a few moments..."
-      );
-      await ctx.reply(
-        `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
+      safeReply(ctx, "⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min");
+      await safeReply(ctx, 
+        `✅ Request opened — Ticket #${ticketId}\nA concierge will reply here shortly.`
       );
       return sendQuickActions(ctx);
     }
@@ -3985,7 +4538,7 @@ bot.on("text", async (ctx) => {
       if (rateLimit.limited) {
         const minutes = Math.ceil(rateLimit.retryAfterMs / 60000);
         resetSession(ctx.chat.id);
-        return ctx.reply(
+        return safeReply(ctx, 
           `You're sending too many requests. Please try again in ${minutes} minute(s).`
         );
       }
@@ -4005,8 +4558,9 @@ bot.on("text", async (ctx) => {
         category: "Flights",
         chatId: ctx.chat.id,
         botKey: "food",
+        answers: session.answers,
       });
-      customerTickets.set(ctx.chat.id, ticketId);
+      addOpenTicketForChat(ctx.chat.id, ticketId);
 
       const summary = formatFlightSummary(session);
       const userTag = ctx.from.username
@@ -4042,11 +4596,9 @@ bot.on("text", async (ctx) => {
       );
 
       resetSession(ctx.chat.id);
-      ctx.reply(
-        "🕘 You're being connected over to our workers! This could take a few moments..."
-      );
-      return ctx.reply(
-        `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
+      safeReply(ctx, "⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min");
+      return safeReply(ctx, 
+        `✅ Request opened — Ticket #${ticketId}\nA concierge will reply here shortly.`
       );
     }
 
@@ -4079,7 +4631,7 @@ bot.on("text", async (ctx) => {
       if (rateLimit.limited) {
         const minutes = Math.ceil(rateLimit.retryAfterMs / 60000);
         resetSession(ctx.chat.id);
-        return ctx.reply(
+        return safeReply(ctx, 
           `You're sending too many requests. Please try again in ${minutes} minute(s).`
         );
       }
@@ -4099,8 +4651,9 @@ bot.on("text", async (ctx) => {
         category: "Hotels",
         chatId: ctx.chat.id,
         botKey: "food",
+        answers: session.answers,
       });
-      customerTickets.set(ctx.chat.id, ticketId);
+      addOpenTicketForChat(ctx.chat.id, ticketId);
 
       const summary = formatHotelSummary(session);
       const userTag = ctx.from.username
@@ -4136,11 +4689,9 @@ bot.on("text", async (ctx) => {
       );
 
       resetSession(ctx.chat.id);
-      ctx.reply(
-        "🕘 You're being connected over to our workers! This could take a few moments..."
-      );
-      return ctx.reply(
-        `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
+      safeReply(ctx, "⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min");
+      return safeReply(ctx, 
+        `✅ Request opened — Ticket #${ticketId}\nA concierge will reply here shortly.`
       );
     }
 
@@ -4172,7 +4723,7 @@ bot.on("text", async (ctx) => {
   setSession(ctx.chat.id, session);
 
   const summary = formatSummary(session.service, session.answers);
-  return ctx.reply(
+  return safeReply(ctx, 
     `Got it for ${service.label}:\n${summary}\n\nSubmit when ready.`,
     confirmMenu()
   );
@@ -4217,6 +4768,7 @@ const botEntries = [{ bot, name: "food" }];
 
 if (flightBotToken) {
   const flightBot = new Telegraf(flightBotToken);
+  attachBotMiddlewares(flightBot, "flight");
   const {
     sessions: flightSessions,
     setSession: setFlightSession,
@@ -4228,6 +4780,9 @@ if (flightBotToken) {
   registerDuffReplyHandler(flightBot);
 
   flightBot.start((ctx) => {
+    if (openTicketCountForChat(ctx.chat.id) > 0) {
+      return promptOpenAnother(ctx, { type: "flight", label: "Flights" });
+    }
     resetFlightSession(ctx.chat.id);
     return sendHome(ctx, FLIGHT_HOME(), flightStartMenu());
   });
@@ -4255,15 +4810,11 @@ if (flightBotToken) {
   flightBot.command("coupon", logCommand);
 
   flightBot.action("flight:start", async (ctx) => {
-    setFlightSession(ctx.chat.id, {
-      service: "flight",
-      stage: "flight_questions",
-      stepIndex: 0,
-      answers: {},
-    });
+    if (openTicketCountForChat(ctx.chat.id) > 0) {
+      return promptOpenAnother(ctx, { type: "flight", label: "Flights" });
+    }
     await ctx.answerCbQuery();
-    await replyHtml(ctx, FLIGHT_PROMO);
-    return replyHtml(ctx, FLIGHT_QUESTIONS[0].prompt);
+    return startFlightFlow(ctx, setFlightSession);
   });
 
   flightBot.action("worker:panel", workerPanelAction);
@@ -4286,8 +4837,14 @@ if (flightBotToken) {
 
   flightBot.on("text", adminPromptHandler);
 
-  flightBot.on("text", (ctx) => {
+  flightBot.on("text", async (ctx) => {
     if (isAdminChat(ctx)) {
+      return;
+    }
+    const ticketHandled = await handleTicketFlow(ctx, {
+      startFlight: () => startFlightFlow(ctx, setFlightSession),
+    });
+    if (ticketHandled) {
       return;
     }
     const session = flightSessions.get(ctx.chat.id);
@@ -4329,7 +4886,7 @@ if (flightBotToken) {
       if (rateLimit.limited) {
         const minutes = Math.ceil(rateLimit.retryAfterMs / 60000);
         resetFlightSession(ctx.chat.id);
-        return ctx.reply(
+        return safeReply(ctx, 
           `You're sending too many requests. Please try again in ${minutes} minute(s).`
         );
       }
@@ -4349,8 +4906,9 @@ if (flightBotToken) {
         category: "Flights",
         chatId: ctx.chat.id,
         botKey: "flight",
+        answers: session.answers,
       });
-      customerTickets.set(ctx.chat.id, ticketId);
+      addOpenTicketForChat(ctx.chat.id, ticketId);
 
       const summary = formatFlightSummary(session);
       const userTag = ctx.from.username
@@ -4386,11 +4944,9 @@ if (flightBotToken) {
       );
 
       resetFlightSession(ctx.chat.id);
-      ctx.reply(
-        "🕘 You're being connected over to our workers! This could take a few moments..."
-      );
-      return ctx.reply(
-        `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
+      safeReply(ctx, "⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min");
+      return safeReply(ctx, 
+        `✅ Request opened — Ticket #${ticketId}\nA concierge will reply here shortly.`
       );
     }
 
@@ -4424,6 +4980,7 @@ if (flightBotToken) {
 
 if (hotelBotToken) {
   const hotelBot = new Telegraf(hotelBotToken);
+  attachBotMiddlewares(hotelBot, "hotel");
   const {
     sessions: hotelSessions,
     setSession: setHotelSession,
@@ -4435,6 +4992,9 @@ if (hotelBotToken) {
   registerDuffReplyHandler(hotelBot);
 
   hotelBot.start((ctx) => {
+    if (openTicketCountForChat(ctx.chat.id) > 0) {
+      return promptOpenAnother(ctx, { type: "hotel", label: "Hotels" });
+    }
     resetHotelSession(ctx.chat.id);
     return sendHome(ctx, HOTEL_HOME(), hotelStartMenu());
   });
@@ -4462,15 +5022,11 @@ if (hotelBotToken) {
   hotelBot.command("coupon", logCommand);
 
   hotelBot.action("hotel:start", async (ctx) => {
-    setHotelSession(ctx.chat.id, {
-      service: "hotel",
-      stage: "hotel_questions",
-      stepIndex: 0,
-      answers: {},
-    });
+    if (openTicketCountForChat(ctx.chat.id) > 0) {
+      return promptOpenAnother(ctx, { type: "hotel", label: "Hotels" });
+    }
     await ctx.answerCbQuery();
-    await replyHtml(ctx, HOTEL_PROMO);
-    return replyHtml(ctx, HOTEL_QUESTIONS[0].prompt);
+    return startHotelFlow(ctx, setHotelSession);
   });
 
   hotelBot.action("worker:panel", workerPanelAction);
@@ -4493,8 +5049,14 @@ if (hotelBotToken) {
 
   hotelBot.on("text", adminPromptHandler);
 
-  hotelBot.on("text", (ctx) => {
+  hotelBot.on("text", async (ctx) => {
     if (isAdminChat(ctx)) {
+      return;
+    }
+    const ticketHandled = await handleTicketFlow(ctx, {
+      startHotel: () => startHotelFlow(ctx, setHotelSession),
+    });
+    if (ticketHandled) {
       return;
     }
     const session = hotelSessions.get(ctx.chat.id);
@@ -4536,7 +5098,7 @@ if (hotelBotToken) {
       if (rateLimit.limited) {
         const minutes = Math.ceil(rateLimit.retryAfterMs / 60000);
         resetHotelSession(ctx.chat.id);
-        return ctx.reply(
+        return safeReply(ctx, 
           `You're sending too many requests. Please try again in ${minutes} minute(s).`
         );
       }
@@ -4556,8 +5118,9 @@ if (hotelBotToken) {
         category: "Hotels",
         chatId: ctx.chat.id,
         botKey: "hotel",
+        answers: session.answers,
       });
-      customerTickets.set(ctx.chat.id, ticketId);
+      addOpenTicketForChat(ctx.chat.id, ticketId);
 
       const summary = formatHotelSummary(session);
       const userTag = ctx.from.username
@@ -4593,11 +5156,9 @@ if (hotelBotToken) {
       );
 
       resetHotelSession(ctx.chat.id);
-      ctx.reply(
-        "🕘 You're being connected over to our workers! This could take a few moments..."
-      );
-      return ctx.reply(
-        `✅ Your ticket has been created, and you're now connected with our workers! This is ticket #${ticketId}`
+      safeReply(ctx, "⏳ Connecting you to a concierge…\n⏱ Typical wait: 1–5 min");
+      return safeReply(ctx, 
+        `✅ Request opened — Ticket #${ticketId}\nA concierge will reply here shortly.`
       );
     }
 
@@ -4629,7 +5190,7 @@ if (hotelBotToken) {
   botEntries.push({ bot: hotelBot, name: "hotel" });
 }
 
-const withTimeout = (promise, ms, label) =>
+const withStartupTimeout = (promise, ms, label) =>
   Promise.race([
     promise,
     new Promise((_, reject) =>
@@ -4655,13 +5216,35 @@ const attachTextGuards = (botInstance, name) => {
         if (safeText !== text) {
           console.warn(`[${name}] empty reply prevented chat:${ctx.chat?.id}`);
         }
-        return originalReply(safeText, extra);
+        return withTimeout(
+          `${name}:ctx.reply`,
+          originalReply(safeText, extra)
+        );
       };
+    }
+    if (ctx.replyWithHTML) {
+      const originalReplyHtml = ctx.replyWithHTML.bind(ctx);
+      ctx.replyWithHTML = (html, extra) =>
+        withTimeout(
+          `${name}:ctx.replyWithHTML`,
+          originalReplyHtml(ensureText(html), extra)
+        );
+    }
+    if (ctx.replyWithPhoto) {
+      const originalReplyPhoto = ctx.replyWithPhoto.bind(ctx);
+      ctx.replyWithPhoto = (photo, extra) =>
+        withTimeout(
+          `${name}:ctx.replyWithPhoto`,
+          originalReplyPhoto(photo, extra)
+        );
     }
     if (ctx.editMessageText) {
       const originalEdit = ctx.editMessageText.bind(ctx);
       ctx.editMessageText = (text, extra) =>
-        originalEdit(ensureText(text), extra);
+        withTimeout(
+          `${name}:ctx.editMessageText`,
+          originalEdit(ensureText(text), extra)
+        );
     }
     return next();
   });
@@ -4673,7 +5256,7 @@ const getMeWithRetry = async (botInstance, name) => {
     : 2;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      await withTimeout(
+      await withStartupTimeout(
         botInstance.telegram.getMe(),
         startupTimeoutMs,
         `${name} getMe`
@@ -4691,7 +5274,7 @@ const getMeWithRetry = async (botInstance, name) => {
 const launchBot = async (botInstance, name) => {
   try {
     try {
-      await withTimeout(
+      await withStartupTimeout(
         botInstance.telegram.deleteWebhook({ drop_pending_updates: true }),
         startupTimeoutMs,
         `${name} deleteWebhook`
