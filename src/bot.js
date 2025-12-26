@@ -1296,11 +1296,18 @@ const sendSubtotalPrompt = async (ctx, label, addressText, suggestedSubtotal) =>
   );
 };
 
-const sendConfirmCard = async (ctx, optionLabel, addressLabel, subtotal) => {
+const sendConfirmCard = async (
+  ctx,
+  optionLabel,
+  addressLabel,
+  addressText,
+  subtotal
+) => {
+  const addressLine = addressText || addressLabel || "Address";
   const message =
     "🧾 Review request\n" +
     `${optionLabel}\n\n` +
-    `📍 ${addressLabel}\n` +
+    `📍 ${addressLine}\n` +
     `💰 Subtotal: $${subtotal.toFixed(2)}\n\n` +
     "Tap ✅ Submit Order to open the request.";
   await step("recordScreen:confirm", () =>
@@ -1763,7 +1770,13 @@ const renderScreen = async (ctx, screenId) => {
           session.temp?.suggestedSubtotal
         );
       }
-      return sendConfirmCard(ctx, session.selectedOption, address.label, subtotal);
+      return sendConfirmCard(
+        ctx,
+        session.selectedOption,
+        address.label,
+        address.text,
+        subtotal
+      );
     }
     case SCREEN.MANAGE_ADDRESSES:
       if (user) {
@@ -2551,6 +2564,7 @@ const handleProfileFlow = async (ctx, session) => {
         ctx,
         session.selectedOption,
         address.label,
+        address.text,
         subtotal
       );
     }
@@ -2621,6 +2635,7 @@ const handleProfileFlow = async (ctx, session) => {
         ctx,
         session.selectedOption,
         address.label,
+        address.text,
         Number(session.temp?.subtotal || 0)
       );
     }
@@ -2801,7 +2816,7 @@ const formatTicketLine = (ticketId, ticket) => {
 };
 
 const completionThankYou = (ticketId) =>
-  `🔒 Ticket #${ticketId} closed.\nType menu to start again.`;
+  `Option A (premium + simple)\n✅ Order #${ticketId} completed\nThanks for choosing Allat50 — appreciate you! 🙌`;
 
 const formatClosedLine = (ticketId, record) => {
   const profit = Number(record.profit) || 0;
