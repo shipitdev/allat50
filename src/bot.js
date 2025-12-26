@@ -1303,7 +1303,9 @@ const sendConfirmCard = async (
   addressText,
   subtotal
 ) => {
-  const addressLine = addressText || addressLabel || "Address";
+  const addressLine = addressText
+    ? `${addressLabel || "Address"} — ${addressText}`
+    : addressLabel || "Address";
   const message =
     "🧾 Review request\n" +
     `${optionLabel}\n\n` +
